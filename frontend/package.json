@@ -12,6 +12,7 @@
     "@element-plus/icons-vue": "^2.3.2",
     "@types/markdown-it": "^14.1.2",
     "axios": "^1.13.4",
+    "echarts": "^6.0.0",
     "element-plus": "^2.13.2",
     "markdown-it": "^14.1.0",
     "sass": "^1.97.3",

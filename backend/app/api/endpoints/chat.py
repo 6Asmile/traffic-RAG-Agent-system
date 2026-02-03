@@ -13,6 +13,7 @@ from starlette.responses import StreamingResponse
 from app.db.session import SessionLocal
 from app.models import ChatSession, ChatMessage, User
 from app.models.knowledge import KnowledgeDoc
+from app.services.analytics_service import AnalyticsService
 from app.services.rag_service import RAGService
 from app.core.security import SECRET_KEY, ALGORITHM
 from pydantic import BaseModel
@@ -163,3 +164,19 @@ def delete_session(session_id: str, db: Session = Depends(get_db), current_user:
     db.query(ChatSession).filter(ChatSession.id == session_id, ChatSession.user_id == current_user.id).delete()
     db.commit()
     return {"status": "success"}
+
+
+@router.get("/analytics")
+def get_analytics(
+        db: Session = Depends(get_db),
+        service: RAGService = Depends(get_rag_service),
+        current_user: User = Depends(get_current_user)
+):
+    """管理员获取数据分析结果"""
+    if current_user.role != "admin":
+        raise HTTPException(403, "无权访问分析数据")
+
+    # 利用 RAGService 里的 embedding 对象进行分析
+    analyzer = AnalyticsService(service.custom_embeddings)
+    data = analyzer.analyze_hot_topics(db)
+    return data
