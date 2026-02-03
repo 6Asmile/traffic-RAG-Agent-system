@@ -1,3 +1,5 @@
+// vite.config.ts 完整修改
+
 import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
 
@@ -6,13 +8,17 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
-      // 凡是接口中包含 /api 的请求，都转发到 8000 端口
       '/api': {
         target: 'http://127.0.0.1:8000',
         changeOrigin: true,
-        // 关键点：后端接口已经是 /api 开头的，所以这里不需要 rewrite 掉 /api
-        // 如果后端接口没有 /api 前缀，才需要 rewrite
-        // rewrite: (path) => path.replace(/^\/api/, '') 
+        // --- 核心修复：禁用代理缓存 ---
+        ws: true, // 支持 websocket
+        configure: (proxy, _options) => {
+          proxy.on('proxyRes', (proxyRes, _req, _res) => {
+            // 告诉代理服务器：这是一个流，不要缓存我！
+            proxyRes.headers['x-accel-buffering'] = 'no';
+          });
+        }
       }
     }
   }

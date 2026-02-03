@@ -2,6 +2,7 @@ import { createRouter, createWebHistory } from 'vue-router';
 import Login from '../views/Login.vue';
 import Chat from '../views/Chat.vue';
 import Profile from '../views/Profile.vue';
+import Admin from '../views/Admin.vue';
 
 const routes = [
   { path: '/', redirect: '/login' },
@@ -17,7 +18,13 @@ const routes = [
     name: 'Profile', 
     component: Profile,
     meta: { requiresAuth: true }
-  }
+  },
+   { 
+    path: '/admin', 
+    name: 'Admin', 
+    component: Admin,
+    meta: { requiresAuth: true }
+  },
 ];
 
 const router = createRouter({

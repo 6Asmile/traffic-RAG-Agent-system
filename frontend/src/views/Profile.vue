@@ -34,6 +34,13 @@
           </el-descriptions-item>
           <el-descriptions-item label="注册时间">{{ user.created_at || '2025-01-01' }}</el-descriptions-item>
         </el-descriptions>
+        
+        <div class="admin-entry" v-if="user.role === 'admin'">
+  <el-divider>管理员操作</el-divider>
+  <el-button type="warning" @click="$router.push('/admin')" :icon="Tools">
+    进入知识库管理后台
+  </el-button>
+</div>
 
         <div class="logout-section">
           <el-button type="danger" plain :icon="SwitchButton" @click="handleLogout">退出登录</el-button>
@@ -44,9 +51,9 @@
 </template>
 
 <script setup lang="ts">
+import { ArrowLeft, Camera, SwitchButton, Tools } from '@element-plus/icons-vue';
 import { ref, onMounted, computed } from 'vue';
 import { useRouter } from 'vue-router';
-import { ArrowLeft, Camera, SwitchButton } from '@element-plus/icons-vue';
 import { ElMessage } from 'element-plus';
 import request from '../api/request';
 
@@ -91,6 +98,11 @@ onMounted(fetchUser);
 </script>
 
 <style scoped lang="scss">
+/* 增加一点样式 */
+.admin-entry {
+  margin-top: 20px;
+  text-align: center;
+}
 .profile-page {
   height: 100vh; width: 100vw; display: flex; justify-content: center; align-items: center;
   background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
