@@ -100,7 +100,7 @@ const handleSubmit = async () => {
     if (isLogin.value) {
       localStorage.setItem('access_token', res.data.access_token);
       ElMessage.success('登录成功！');
-      router.push('/chat');
+      router.push('/');
     } else {
       ElMessage.success('注册成功，请登录');
       isLogin.value = true;

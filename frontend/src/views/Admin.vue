@@ -89,8 +89,10 @@
         <div class="stat-item">
           <span class="label">总切片:</span>
           <span class="value">{{ totalChunks }}</span>
+          <!-- 修改跳转路径 -->
+  
         </div>
-        <el-button @click="$router.back()" link :icon="ArrowLeft">返回聊天</el-button>
+        <el-button @click="$router.push('/')" link :icon="HomeFilled">返回系统首页</el-button>
       </footer>
     </div>
   </div>
@@ -100,6 +102,7 @@
 import { ref, onMounted, computed, nextTick } from 'vue';
 import { Plus, Collection, Delete, ArrowLeft, PieChart, Refresh } from '@element-plus/icons-vue';
 import { ElMessage, ElMessageBox } from 'element-plus';
+import { HomeFilled } from '@element-plus/icons-vue';
 import request from '../api/request';
 import * as echarts from 'echarts';
 

@@ -16,7 +16,7 @@ from app.models.knowledge import KnowledgeDoc
 from app.services.analytics_service import AnalyticsService
 from app.services.graph_service import GraphService
 from app.services.rag_service import RAGService
-from app.core.security import SECRET_KEY, ALGORITHM
+from app.core.security import SECRET_KEY, ALGORITHM, verify_password, get_password_hash
 from pydantic import BaseModel
 
 reusable_oauth2 = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login")
@@ -227,3 +227,59 @@ async def build_graph(db: Session = Depends(get_db), service: RAGService = Depen
     gs = GraphService(service.llm)
     await gs.build_from_texts(db, texts)
     return {"status": "success", "message": f"已从 {len(texts)} 条文本中提取并更新图谱"}
+
+
+@router.get("/stats")
+def get_user_stats(
+        db: Session = Depends(get_db),
+        current_user: User = Depends(get_current_user)
+):
+    """获取用户真实统计数据"""
+    # 1. 计算加入天数
+    delta = datetime.utcnow() - current_user.created_at
+    join_days = max(delta.days, 1)  # 至少显示1天
+
+    # 2. 计算咨询次数 (该用户所有会话中的用户提问总数)
+    # 先找到该用户的所有 session_id
+    user_sessions = db.query(ChatSession.id).filter(ChatSession.user_id == current_user.id).all()
+    session_ids = [s[0] for s in user_sessions]
+
+    query_count = db.query(ChatMessage).filter(
+        ChatMessage.session_id.in_(session_ids),
+        ChatMessage.role == "user"
+    ).count()
+
+    return {"join_days": join_days, "query_count": query_count}
+
+
+@router.put("/update_me")
+def update_user_info(
+        new_name: str,
+        db: Session = Depends(get_db),
+        current_user: User = Depends(get_current_user)
+):
+    """修改用户名"""
+    # 检查重名
+    existing = db.query(User).filter(User.username == new_name).first()
+    if existing and existing.id != current_user.id:
+        raise HTTPException(400, "用户名已存在")
+
+    current_user.username = new_name
+    db.commit()
+    return {"status": "success", "new_name": new_name}
+
+
+@router.post("/change_password")
+def change_password(
+        old_pwd: str,
+        new_pwd: str,
+        db: Session = Depends(get_db),
+        current_user: User = Depends(get_current_user)
+):
+    """修改密码"""
+    if not verify_password(old_pwd, current_user.hashed_password):
+        raise HTTPException(400, "旧密码错误")
+
+    current_user.hashed_password = get_password_hash(new_pwd)
+    db.commit()
+    return {"status": "success"}

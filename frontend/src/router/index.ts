@@ -4,9 +4,15 @@ import Chat from '../views/Chat.vue';
 import Profile from '../views/Profile.vue';
 import Admin from '../views/Admin.vue';
 import GraphView from '../views/GraphView.vue';
+import Landing from '../views/Landing.vue';
 
 const routes = [
-  { path: '/', redirect: '/login' },
+  { 
+    path: '/', 
+    name: 'Landing', 
+    component: Landing,
+    meta: { requiresAuth: true } // 必须登录后才能选择功能
+  },
   { path: '/login', name: 'Login', component: Login },
   { 
     path: '/chat', 
