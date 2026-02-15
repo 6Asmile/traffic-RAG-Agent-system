@@ -8,7 +8,8 @@ export default defineConfig({
     host: '0.0.0.0', 
     // --- 核心修复：添加以下配置 ---
     allowedHosts: [
-      'ragqa.asmi1e.us.ci' // 允许你的 Cloudflare 域名访问
+      'ragqa.asmi1e.us.ci', // 允许你的 Cloudflare 域名访问
+       '192.168.1.6' // <--- 必须加上你电脑的局域网 IP
     ],
     proxy: {
       '/api': {

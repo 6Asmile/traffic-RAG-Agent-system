@@ -5,4 +5,5 @@ from app.models.chat import ChatMessage,ChatSession
 from app.models.knowledge import KnowledgeBase
 from app.models.analysis import HotTopic
 from .graph import GraphNode, GraphEdge
+from  .quiz import UserQuizRecord,Question
 # 这样以后你再增加新的模型文件（比如 ChatLog），也记得在这里加一行

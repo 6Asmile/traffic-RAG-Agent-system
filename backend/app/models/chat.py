@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Text, DateTime, JSON
+from sqlalchemy import Column, Integer, String, Text, DateTime, JSON, Boolean
 from app.db.base import Base
 from datetime import datetime
 
@@ -16,4 +16,6 @@ class ChatMessage(Base):
     role = Column(String(20)) # 'user' or 'ai'
     content = Column(Text)
     sources = Column(JSON, nullable=True) # 存入来源数组
+    is_helpful = Column(Boolean, nullable=True)  # True: 点赞, False: 点踩
+    feedback_note = Column(Text, nullable=True)  # 用户填写的具体反馈建议
     created_at = Column(DateTime, default=datetime.now)

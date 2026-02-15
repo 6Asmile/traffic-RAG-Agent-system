@@ -5,7 +5,7 @@ import Profile from '../views/Profile.vue';
 import Admin from '../views/Admin.vue';
 import GraphView from '../views/GraphView.vue';
 import Landing from '../views/Landing.vue';
-
+import Quiz from '../views/Quiz.vue'; 
 const routes = [
   { 
     path: '/', 
@@ -37,6 +37,12 @@ const routes = [
     name: 'Graph', 
     component: GraphView,
     meta: { requiresAuth: true }
+  },
+  { 
+    path: '/quiz', 
+    name: 'Quiz', 
+    component: Quiz, 
+    meta: { requiresAuth: true } 
   },
 ];
 

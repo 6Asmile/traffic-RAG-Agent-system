@@ -1,0 +1,30 @@
+<component name="InspectionProjectProfileManager">
+  <profile version="1.0">
+    <option name="myName" value="Project Default" />
+    <inspection_tool class="PyPackageRequirementsInspection" enabled="true" level="WARNING" enabled_by_default="true">
+      <option name="ignoredPackages">
+        <value>
+          <list size="17">
+            <item index="0" class="java.lang.String" itemvalue="djangorestframework-simplejwt" />
+            <item index="1" class="java.lang.String" itemvalue="mysqlclient" />
+            <item index="2" class="java.lang.String" itemvalue="python-docx" />
+            <item index="3" class="java.lang.String" itemvalue="librabbitmq" />
+            <item index="4" class="java.lang.String" itemvalue="python-dotenv" />
+            <item index="5" class="java.lang.String" itemvalue="pypdf" />
+            <item index="6" class="java.lang.String" itemvalue="dj-rest-auth" />
+            <item index="7" class="java.lang.String" itemvalue="redis" />
+            <item index="8" class="java.lang.String" itemvalue="celery" />
+            <item index="9" class="java.lang.String" itemvalue="simpleui" />
+            <item index="10" class="java.lang.String" itemvalue="django-filter" />
+            <item index="11" class="java.lang.String" itemvalue="Django" />
+            <item index="12" class="java.lang.String" itemvalue="django-redis" />
+            <item index="13" class="java.lang.String" itemvalue="django-allauth" />
+            <item index="14" class="java.lang.String" itemvalue="gevent" />
+            <item index="15" class="java.lang.String" itemvalue="djangorestframework" />
+            <item index="16" class="java.lang.String" itemvalue="django-cors-headers" />
+          </list>
+        </value>
+      </option>
+    </inspection_tool>
+  </profile>
+</component>

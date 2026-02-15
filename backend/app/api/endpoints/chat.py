@@ -52,31 +52,48 @@ def get_rag_service(db: Session = Depends(get_db)):
     return RAGService(db)
 
 
-def save_chat_to_db(session_id: str, content: str, sources: str):
-    """异步后台保存聊天记录"""
+def save_chat_to_db(session_id: str, content: str, sources: str) -> int:
+    """同步保存聊天记录并返回消息ID"""
     with SessionLocal() as db:
         try:
-            db.add(ChatMessage(session_id=session_id, role="ai", content=content, sources=sources))
+            # 1. 创建消息对象
+            msg = ChatMessage(
+                session_id=session_id,
+                role="ai",
+                content=content,
+                sources=sources
+            )
+            db.add(msg)
+
+            # 2. 更新会话时间
             sess = db.query(ChatSession).filter(ChatSession.id == session_id).first()
-            if sess: sess.updated_at = datetime.now()
+            if sess:
+                sess.updated_at = datetime.now()
+
+            # 3. 提交并刷新以获取 ID
             db.commit()
+            db.refresh(msg)  # 关键：刷新后 msg.id 才有值
+            return msg.id
         except Exception as e:
             logger.error(f"Save failed: {e}")
+            return 0
 
 
 @router.post("/ask_stream")
 async def ask_question_stream(
         request: ChatRequest,
-        background_tasks: BackgroundTasks,
+        # background_tasks: BackgroundTasks, # 这里不再需要 BackgroundTasks 来存 AI 消息了
         db: Session = Depends(get_db),
         service: RAGService = Depends(get_rag_service),
         current_user: User = Depends(get_current_user)
 ):
-    # 1. 会话持久化
+    # 1. 会话持久化 (保持不变)
     session = db.query(ChatSession).filter(ChatSession.id == request.session_id).first()
     if not session:
         session = ChatSession(id=request.session_id, title=request.question[:15], user_id=current_user.id)
         db.add(session)
+
+    # 用户提问依然可以先存，或者你也想拿到用户消息ID的话，也可以改成同步
     db.add(ChatMessage(session_id=request.session_id, role="user", content=request.question))
     db.commit()
 
@@ -88,21 +105,32 @@ async def ask_question_stream(
         async for line in service.chat_stream(request.question, request.session_id):
             if not line: continue
 
-            # 解析内容用于保存
             try:
                 data = json.loads(line)
-                if data["type"] == "content":
-                    full_content += data["data"]
-                elif data["type"] == "sources":
-                    sources_json = json.dumps(data["data"])
-                elif data["type"] == "done":
-                    # 流结束，提交保存任务
-                    background_tasks.add_task(save_chat_to_db, request.session_id, full_content, sources_json)
-            except:
-                pass
 
-            # 【核心修复】严格遵守 SSE 协议格式：data: <JSON>\n\n
-            # 最后的两个换行符是前端 split("\n\n") 的关键
+                # 收集内容
+                if data["type"] == "content":
+                    full_content += data.get("data", "")
+
+                # 收集来源
+                elif data["type"] == "sources":
+                    sources_json = json.dumps(data.get("data", []))
+
+                # --- 核心修改：处理完成信号 ---
+                elif data["type"] == "done":
+                    # 1. 同步保存到数据库，获取 ID
+                    ai_msg_id = save_chat_to_db(request.session_id, full_content, sources_json)
+
+                    # 2. 将 ID 注入到返回数据中
+                    data["message_id"] = ai_msg_id
+
+                    # 3. 重新序列化为字符串
+                    line = json.dumps(data)
+
+            except Exception as e:
+                logger.error(f"Stream processing error: {e}")
+
+            # 发送数据 (符合 SSE 格式)
             yield f"data: {line.strip()}\n\n"
 
     return StreamingResponse(
@@ -110,13 +138,12 @@ async def ask_question_stream(
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",  # 彻底禁用代理缓存
+            "X-Accel-Buffering": "no",
             "Connection": "keep-alive"
         }
     )
 
 
-# --- 其余接口（me, sessions, history, upload...）保持原样 ---
 @router.get("/me")
 def get_me(current_user: User = Depends(get_current_user)):
     return {"username": current_user.username, "avatar": current_user.avatar, "role": current_user.role,
@@ -283,3 +310,39 @@ def change_password(
     current_user.hashed_password = get_password_hash(new_pwd)
     db.commit()
     return {"status": "success"}
+
+
+class FeedbackRequest(BaseModel):
+    message_id: int
+    is_helpful: bool
+    note: Optional[str] = None
+
+
+@router.post("/feedback")
+def give_feedback(
+        request: FeedbackRequest,
+        db: Session = Depends(get_db),
+        current_user: User = Depends(get_current_user)
+):
+    """用户对回答质量进行评价"""
+    # 查找该条消息
+    msg = db.query(ChatMessage).filter(ChatMessage.id == request.message_id).first()
+
+    if not msg:
+        raise HTTPException(status_code=404, detail="消息不存在")
+
+    # 校验权限：该消息必须属于当前用户的某个会话
+    session = db.query(ChatSession).filter(
+        ChatSession.id == msg.session_id,
+        ChatSession.user_id == current_user.id
+    ).first()
+
+    if not session:
+        raise HTTPException(status_code=403, detail="无权操作此消息")
+
+    # 更新反馈信息
+    msg.is_helpful = request.is_helpful
+    msg.feedback_note = request.note
+    db.commit()
+
+    return {"status": "success", "message": "感谢您的反馈！"}

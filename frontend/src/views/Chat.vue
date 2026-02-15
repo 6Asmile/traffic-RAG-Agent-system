@@ -42,7 +42,7 @@
               <span class="username">{{ currentUser.username || 'Asmile' }}</span>
               <div class="status-wrapper">
                 <span class="pulse-dot"></span>
-                <span class="status-text">在线</span>
+                <span class="status-text">在线 · 交通专家</span>
               </div>
             </div>
             <el-icon class="settings-icon"><Setting /></el-icon>
@@ -50,7 +50,7 @@
         </div>
       </aside>
 
-      <!-- 2. 移动端抽屉：已补全用户信息区域 -->
+      <!-- 2. 移动端抽屉 -->
       <el-drawer v-model="mobileMenuVisible" direction="ltr" size="280px" :with-header="false">
         <div class="mobile-sidebar-content">
           <div class="sidebar-header">
@@ -62,10 +62,11 @@
               <el-icon class="msg-icon"><ChatLineRound /></el-icon>
               <div class="session-info">
                 <span class="title">{{ s.title }}</span>
+                <span class="time">{{ formatTime(s.updated_at) }}</span>
               </div>
+              <el-icon class="delete-btn" @click.stop="deleteSession(s.id)"><Delete /></el-icon>
             </div>
           </div>
-          <!-- 移动端底部用户信息 -->
           <div class="sidebar-footer" @click="$router.push('/profile')">
             <div class="user-profile-card">
               <div class="avatar-wrapper">
@@ -79,7 +80,6 @@
                   <span class="status-text">在线</span>
                 </div>
               </div>
-              <el-icon class="settings-icon"><Setting /></el-icon>
             </div>
           </div>
         </div>
@@ -95,14 +95,12 @@
               <h3 class="title">{{ currentSessionTitle }}</h3>
             </div>
           </div>
-
           <div class="header-right">
-    <!-- 新增：返回首页按钮 -->
-    <el-button circle @click="$router.push('/')" title="返回首页">
-      <el-icon><HomeFilled /></el-icon>
-    </el-button>
-    <el-button circle :icon="Refresh" @click="fetchHistory(currentSessionId)" title="刷新记录" />
-  </div>
+             <el-button circle @click="$router.push('/')" title="返回首页">
+                <el-icon><HomeFilled /></el-icon>
+             </el-button>
+            <el-button circle :icon="Refresh" @click="fetchHistory(currentSessionId)" />
+          </div>
         </header>
 
         <div class="message-wall custom-scrollbar" ref="messageBox">
@@ -114,7 +112,7 @@
               <div class="suggestion-grid">
                 <div class="suggest-card" @click="quickStart('饮酒驾驶如何处罚？')">🍺 酒驾处罚标准</div>
                 <div class="suggest-card" @click="quickStart('交通事故处理流程')">🚑 事故处理流程</div>
-                <div class="suggest-card" @click="quickStart('交通信号有哪些')">🍺 交通信号有哪些</div>
+                <div class="suggest-card" @click="quickStart('从南京南站到夫子庙怎么走')">🗺️ 路径规划</div>
               </div>
             </div>
           </div>
@@ -125,7 +123,27 @@
               <div class="markdown-body" v-html="renderMarkdown(msg.content)"></div>
               
               <div v-if="msg.role === 'ai'" class="ai-footer">
-                <el-button type="primary" link :icon="VideoPlay" @click="speak(msg.content)">朗读回答</el-button>
+                <div class="actions-left">
+                   <el-button type="primary" link :icon="VideoPlay" @click="speak(msg.content)">朗读</el-button>
+                   <!-- 点赞/点踩 -->
+                    <el-button 
+                        link 
+                        :type="msg.is_helpful === true ? 'success' : 'default'"
+                        :icon="CaretTop" 
+                        @click="handleFeedback(msg, true)"
+                    >
+                        有用
+                    </el-button>
+                    
+                    <el-button 
+                        link 
+                        :type="msg.is_helpful === false ? 'danger' : 'default'"
+                        :icon="CaretBottom" 
+                        @click="handleFeedback(msg, false)"
+                    >
+                        没用
+                    </el-button>
+                </div>
                 
                 <div v-if="msg.sources?.length" class="source-tag">
                   <el-popover 
@@ -187,13 +205,20 @@
 <script setup lang="ts">
 import { ref, onMounted, nextTick, computed, reactive } from 'vue';
 import { useRouter } from 'vue-router';
-import { Plus, ChatLineRound, Delete, Refresh, Document, Top, Menu, Microphone, Mic, VideoPlay, Setting ,HomeFilled} from '@element-plus/icons-vue';
+import { Plus, ChatLineRound, Delete, Refresh, Document, Top, Menu, Microphone, Mic, VideoPlay, Setting, CaretTop, CaretBottom, HomeFilled, ChatDotSquare } from '@element-plus/icons-vue';
 import { ElMessage, ElMessageBox } from 'element-plus';
 import request from '../api/request';
 import MarkdownIt from 'markdown-it';
+
 // --- 类型定义 ---
 interface SessionItem { id: string; title: string; updated_at?: string; }
-interface Message { role: 'user' | 'ai'; content: string; sources?: string[]; }
+interface Message { 
+  id?: number;
+  role: 'user' | 'ai'; 
+  content: string; 
+  sources?: string[]; 
+  is_helpful?: boolean | null;
+}
 
 const router = useRouter();
 const sessions = ref<SessionItem[]>([]);
@@ -234,15 +259,28 @@ onMounted(async () => {
     const [userRes, sessRes] = await Promise.all([request.get('/v1/chat/me'), request.get('/v1/chat/sessions')]);
     currentUser.value = userRes.data;
     sessions.value = sessRes.data;
-    if (sessions.value[0]) await switchSession(sessions.value[0].id); else createNewChat();
-  } catch (e) { router.push('/login'); }
+    
+    // 修复 TS 错误：显式判断第一个元素
+    const firstSession = sessions.value[0];
+    if (firstSession) {
+       await switchSession(firstSession.id); 
+    } else {
+       createNewChat();
+    }
+  } catch (e) { 
+      // 忽略部分错误，防止页面白屏
+  }
 });
 
 const fetchSessions = async () => { sessions.value = (await request.get('/v1/chat/sessions')).data; };
 const fetchHistory = async (id: string) => {
   const res = await request.get(`/v1/chat/history/${id}`);
   chatHistory.value = res.data.map((m: any) => ({
-    role: m.role, content: m.content, sources: typeof m.sources === 'string' ? JSON.parse(m.sources) : m.sources
+    id: m.id,
+    is_helpful: m.is_helpful,
+    role: m.role as 'user'|'ai', // 断言修复类型
+    content: m.content, 
+    sources: typeof m.sources === 'string' ? JSON.parse(m.sources) : (m.sources || [])
   }));
   await scrollToBottom();
 };
@@ -251,13 +289,18 @@ const switchSessionAndClose = async (id: string) => { await switchSession(id); m
 const createNewChat = () => { currentSessionId.value = `session_${Math.random().toString(36).substr(2, 9)}`; chatHistory.value = []; };
 const createNewChatAndClose = () => { createNewChat(); mobileMenuVisible.value = false; };
 
+// --- 核心流式逻辑 ---
 const handleSend = async () => {
   if (!inputQuery.value.trim() || loading.value) return;
+
   const question = inputQuery.value.trim();
   const sid = currentSessionId.value;
+
   chatHistory.value.push({ role: 'user', content: question });
   inputQuery.value = '';
   loading.value = true;
+
+  // 使用 reactive 修复流式不更新问题
   const aiMsg = reactive<Message>({ role: 'ai', content: '', sources: [] });
   chatHistory.value.push(aiMsg);
   await scrollToBottom();
@@ -268,28 +311,47 @@ const handleSend = async () => {
       headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${localStorage.getItem('access_token')}` },
       body: JSON.stringify({ question, session_id: sid })
     });
-    const reader = response.body?.getReader();
+    
+    if (!response.body) throw new Error("No Body");
+    const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
+    
     while (true) {
-      const { done, value } = await reader!.read();
+      const { done, value } = await reader.read();
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
       let lines = buffer.split("\n\n");
       buffer = lines.pop() || "";
+      
       for (const line of lines) {
         if (!line.startsWith("data:")) continue;
-        const payload = JSON.parse(line.replace("data:", "").trim());
-        if (payload.type === 'sources') aiMsg.sources = payload.data;
-        else if (payload.type === 'content') {
-          aiMsg.content += payload.data;
-          if (messageBox.value) messageBox.value.scrollTop = messageBox.value.scrollHeight;
-        }
+        const jsonStr = line.replace(/^data:\s*/, "");
+        try {
+            const payload = JSON.parse(jsonStr);
+            if (payload.type === 'sources') aiMsg.sources = payload.data;
+            else if (payload.type === 'content') {
+                aiMsg.content += payload.data;
+                if (messageBox.value) messageBox.value.scrollTop = messageBox.value.scrollHeight;
+            } else if (payload.type === 'done') {
+                if (payload.message_id) aiMsg.id = payload.message_id;
+            }
+        } catch(e) {}
       }
+      // 强制微任务更新
       await nextTick();
     }
     await fetchSessions();
-  } catch (e) { ElMessage.error('连接中断'); } finally { loading.value = false; }
+  } catch (e) { aiMsg.content += "\n⚠️ 连接中断"; } finally { loading.value = false; await scrollToBottom(); }
+};
+
+const handleFeedback = async (msg: Message, helpful: boolean) => {
+  if (!msg.id) return ElMessage.warning('请稍等...');
+  try {
+    await request.post('/v1/chat/feedback', { message_id: msg.id, is_helpful: helpful });
+    msg.is_helpful = helpful;
+    ElMessage.success('感谢反馈');
+  } catch (e) { ElMessage.error('失败'); }
 };
 
 const speak = (t: string) => {
@@ -309,16 +371,14 @@ const deleteSession = async (id: string) => {
     if (currentSessionId.value === id) createNewChat();
   } catch (e) {}
 };
+
+// 辅助函数：解决 TS 6133 报错
+function jsonParseSafe(str: string) { try { return JSON.parse(str); } catch(e) { return null; } }
 </script>
 
 <style scoped lang="scss">
-/* --- 布局容器修复 --- */
-.glass-provider {
-  height: 100vh; width: 100vw; background: #f0f2f5;
-  display: flex; justify-content: center; align-items: center;
-  position: relative; overflow: hidden;
-}
-
+/* --- 布局容器 --- */
+.glass-provider { height: 100vh; width: 100vw; background: #f0f2f5; display: flex; justify-content: center; align-items: center; position: relative; overflow: hidden; }
 .bg-glow-1 { position: absolute; top: -10%; left: -10%; width: 40%; height: 40%; background: radial-gradient(circle, rgba(64, 158, 255, 0.1) 0%, transparent 70%); filter: blur(60px); }
 .bg-glow-2 { position: absolute; bottom: -10%; right: -10%; width: 40%; height: 40%; background: radial-gradient(circle, rgba(103, 194, 58, 0.08) 0%, transparent 70%); filter: blur(60px); }
 
@@ -329,23 +389,19 @@ const deleteSession = async (id: string) => {
   @media (max-width: 768px) { width: 100%; height: 100%; border-radius: 0; }
 }
 
-/* --- 侧边栏及移动端抽屉布局 --- */
+/* --- 侧边栏 --- */
 .sidebar, .mobile-sidebar-content {
   width: 280px; background: rgba(255, 255, 255, 0.45); border-right: 1px solid rgba(0,0,0,0.06);
   display: flex; flex-direction: column; padding: 20px 12px; height: 100%; box-sizing: border-box;
 }
 
-.sidebar {
-  @media (max-width: 768px) { display: none; }
-}
-
-.mobile-sidebar-content {
-  width: 100%; border-right: none; background: #fff; // 抽屉内部背景设为实色更清晰
-}
+.sidebar { @media (max-width: 768px) { display: none; } }
+.mobile-sidebar-content { width: 100%; background: #fff; border-right: none; }
 
 .new-chat-btn {
   width: 100%; height: 44px; border-radius: 10px; font-weight: 600;
   background: #409eff; color: white; border: none; margin-bottom: 20px;
+  display: flex; align-items: center; justify-content: center; gap: 8px;
 }
 
 .session-manager {
@@ -359,7 +415,7 @@ const deleteSession = async (id: string) => {
   &:hover { background: rgba(0,0,0,0.04); .delete-btn { opacity: 1; } }
   &.active { background: #fff; box-shadow: 0 4px 10px rgba(0,0,0,0.04); color: #409eff; }
   .session-info { flex: 1; overflow: hidden; .title { font-size: 13.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; display: block; } .time { font-size: 10px; opacity: 0.5; } }
-  .delete-btn { opacity: 0; font-size: 14px; color: #f56c6c; }
+  .delete-btn { opacity: 0; font-size: 14px; color: #f56c6c; transition: 0.2s; &:hover { color: red; } }
 }
 
 .sidebar-footer {
@@ -369,6 +425,7 @@ const deleteSession = async (id: string) => {
     box-shadow: 0 2px 8px rgba(0,0,0,0.03); cursor: pointer;
     .avatar-wrapper { position: relative; .online-badge { position: absolute; bottom: 0; right: 0; width: 9px; height: 9px; background: #67C23A; border: 2px solid #fff; border-radius: 50%; } }
     .user-meta { flex: 1; .username { font-size: 13px; font-weight: bold; color: #333; display: block; } .status-wrapper { display: flex; align-items: center; gap: 4px; .status-text { font-size: 10px; color: #999; } .pulse-dot { width: 5px; height: 5px; background: #67C23A; border-radius: 50%; animation: pulse 2s infinite; } } }
+    .settings-icon { opacity: 0.5; }
   }
 }
 
@@ -377,8 +434,9 @@ const deleteSession = async (id: string) => {
 .main-header {
   padding: 12px 20px; border-bottom: 1px solid rgba(0,0,0,0.04);
   display: flex; justify-content: space-between; align-items: center;
-  .session-display { .label { font-size: 9px; color: #999; } .title { font-size: 15px; margin: 0; color: #333; } }
+  .header-left { display: flex; align-items: center; gap: 15px; }
   .mobile-menu-btn { display: none; @media (max-width: 768px) { display: inline-flex; } }
+  .session-display { .label { font-size: 9px; color: #999; display: block; } .title { font-size: 16px; margin: 0; color: #333; font-weight: bold; } }
 }
 
 .message-wall { flex: 1; padding: 20px 15% 120px; overflow-y: auto; @media (max-width: 768px) { padding: 15px 10px 100px; } }
@@ -391,9 +449,10 @@ const deleteSession = async (id: string) => {
 }
 
 .ai-footer {
-  margin-top: 10px; padding-top: 8px; border-top: 1px solid rgba(0,0,0,0.03);
-  display: flex; justify-content: space-between; align-items: center;
-  .src-link { font-size: 11px; color: #409eff; cursor: pointer; display: flex; align-items: center; gap: 3px; }
+  margin-top: 10px; padding-top: 8px; border-top: 1px solid rgba(0,0,0,0.05);
+  display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap;
+  .actions-left { display: flex; gap: 10px; }
+  .src-link { font-size: 11px; color: #409eff; cursor: pointer; display: flex; align-items: center; gap: 3px; &:hover { text-decoration: underline; } }
 }
 
 /* --- 输入框 --- */
@@ -401,9 +460,10 @@ const deleteSession = async (id: string) => {
   position: absolute; bottom: 20px; left: 15%; right: 15%;
   @media (max-width: 768px) { left: 10px; right: 10px; bottom: 10px; }
   .input-pill {
-    background: #fff; border-radius: 20px; padding: 6px 12px; display: flex; align-items: center; gap: 8px;
+    background: #fff; border-radius: 24px; padding: 6px 12px; display: flex; align-items: center; gap: 8px;
     box-shadow: 0 4px 20px rgba(0,0,0,0.08); border: 1px solid #eee;
-    :deep(.el-textarea__inner) { border: none; box-shadow: none; padding: 8px; font-size: 14px; }
+    :deep(.el-textarea__inner) { border: none; box-shadow: none; padding: 8px; font-size: 14px; background: transparent; }
+    .voice-btn { transition: 0.3s; &:hover { background: #f0f0f0; } }
   }
   .footer-copy { text-align: center; font-size: 10px; color: #ccc; margin-top: 8px; }
 }
@@ -413,7 +473,7 @@ const deleteSession = async (id: string) => {
   height: 80%; display: flex; justify-content: center; align-items: center; text-align: center;
   .icon-circle { font-size: 50px; margin-bottom: 15px; }
   h1 { font-size: 24px; color: #333; margin-bottom: 20px; }
-  .suggestion-grid { display: flex; gap: 12px; .suggest-card { background: #f9f9f9; padding: 12px 20px; border-radius: 12px; cursor: pointer; font-size: 13px; border: 1px solid #eee; &:hover { border-color: #409eff; color: #409eff; } } }
+  .suggestion-grid { display: flex; gap: 12px; flex-wrap: wrap; justify-content: center; .suggest-card { background: #f9f9f9; padding: 12px 20px; border-radius: 12px; cursor: pointer; font-size: 13px; border: 1px solid #eee; &:hover { border-color: #409eff; color: #409eff; transform: translateY(-2px); } } }
 }
 
 /* --- 滚动条修复 --- */
@@ -430,7 +490,9 @@ const deleteSession = async (id: string) => {
 
 .custom-scrollbar::-webkit-scrollbar { width: 4px; }
 .custom-scrollbar::-webkit-scrollbar-thumb { background: #eee; border-radius: 4px; }
+.typing-dots { span { width: 6px; height: 6px; background: #909399; border-radius: 50%; display: inline-block; margin: 0 2px; animation: blink 1.4s infinite; } span:nth-child(2) { animation-delay: 0.2s; } span:nth-child(3) { animation-delay: 0.4s; } }
 @keyframes pulse { 0% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(103, 194, 58, 0.7); } 70% { transform: scale(1); box-shadow: 0 0 0 6px rgba(103, 194, 58, 0); } 100% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(103, 194, 58, 0); } }
+@keyframes blink { 0% { opacity: 0.2; } 20% { opacity: 1; } 100% { opacity: 0.2; } }
 
 /* 专门针对移动端抽屉的调整 */
 :deep(.el-drawer__body) { padding: 0; }

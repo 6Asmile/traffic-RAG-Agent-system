@@ -42,7 +42,7 @@ class RAGService:
 
         # 主对话模型 (Temp=0 保证严谨)
         self.llm = ChatOpenAI(model=llm_cfg.model_name, openai_api_key=llm_cfg.api_key,
-                              openai_api_base=llm_cfg.base_url, temperature=0, streaming=True)
+                              openai_api_base=llm_cfg.base_url, temperature=0.1, streaming=True)
 
         # 专门用于改写逻辑的模型 (Temp=0.5 增加灵活性)
         self.rewriter_llm = ChatOpenAI(model=llm_cfg.model_name, openai_api_key=llm_cfg.api_key,

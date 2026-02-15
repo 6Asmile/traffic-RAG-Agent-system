@@ -32,7 +32,15 @@
           </div>
           <el-icon class="arrow"><ArrowRight /></el-icon>
         </div>
-
+        <!-- 5. 每日一练 (新功能) -->
+<div class="nav-card" @click="$router.push('/quiz')">
+  <div class="card-icon quiz-icon"><el-icon><Edit /></el-icon></div>
+  <div class="card-body">
+    <h3>每日一练</h3>
+    <p>AI 智能出题，通过答题巩固交通法规知识。</p>
+  </div>
+  <el-icon class="arrow"><ArrowRight /></el-icon>
+</div>
         <!-- 3. 管理后台 (仅管理员可见) -->
         <div v-if="userRole === 'admin'" class="nav-card admin-card" @click="$router.push('/admin')">
           <div class="card-icon admin-icon"><el-icon><Monitor /></el-icon></div>
@@ -65,7 +73,7 @@
 <script setup lang="ts">
 import { ref, onMounted } from 'vue';
 import { useRouter } from 'vue-router';
-import { ChatLineRound, Share, Monitor, User, ArrowRight, SwitchButton } from '@element-plus/icons-vue';
+import { ChatLineRound, Share, Monitor, User, ArrowRight, SwitchButton, Edit } from '@element-plus/icons-vue';
 import request from '../api/request';
 
 const router = useRouter();
@@ -131,6 +139,7 @@ const handleLogout = () => {
     &.graph-icon { background: #f0f9eb; color: #67c23a; }
     &.admin-icon { background: #fdf6ec; color: #e6a23c; }
     &.profile-icon { background: #f4f4f5; color: #909399; }
+    &.quiz-icon { background: #fdf5e6; color: #ff9800; }
   }
 
   .card-body {
