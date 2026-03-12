@@ -2,6 +2,7 @@
 
 import json
 import logging
+import os
 from datetime import datetime
 from typing import Optional
 from fastapi import APIRouter, UploadFile, File, Depends, HTTPException, BackgroundTasks
@@ -10,6 +11,7 @@ from jose import jwt
 from sqlalchemy.orm import Session
 from starlette.responses import StreamingResponse
 
+from app.core.config import settings
 from app.db.session import SessionLocal
 from app.models import ChatSession, ChatMessage, User, HotTopic, AIConfig
 from app.models.knowledge import KnowledgeDoc
@@ -165,6 +167,7 @@ def get_history(session_id: str, db: Session = Depends(get_db), current_user: Us
 
 @router.post("/upload")
 async def upload_knowledge_file(
+        background_tasks: BackgroundTasks,  # 引入后台任务队列
         file: UploadFile = File(...),
         db: Session = Depends(get_db),
         service: RAGService = Depends(get_rag_service),
@@ -173,28 +176,42 @@ async def upload_knowledge_file(
     if current_user.role != "admin":
         raise HTTPException(status_code=403, detail="仅管理员可上传知识库")
 
-    allowed_exts = ['pdf', 'txt', 'docx']
+    allowed_exts = ['pdf', 'txt', 'docx', 'md']
     ext = file.filename.split('.')[-1].lower()
     if ext not in allowed_exts:
         raise HTTPException(status_code=400, detail=f"仅支持 {allowed_exts} 格式")
 
     try:
-        # 1. 调用高级解析管线，返回的是解析并富化后的字符串列表
-        valid_texts = service.ingest_knowledge(file, file.filename)
+        # 1. 快速保存物理文件到本地
+        upload_path = os.path.join(settings.BASE_DIR, "data", "uploads")
+        os.makedirs(upload_path, exist_ok=True)
+        file_save_path = os.path.join(upload_path, file.filename)
 
-        # 2. 将解析好的文本列表直接存入 MySQL
+        with open(file_save_path, "wb") as buffer:
+            import shutil
+            shutil.copyfileobj(file.file, buffer)
+
+        # 2. 先在数据库里创建一个“处理中”的记录 (chunk_count = 0)
         new_doc = KnowledgeDoc(
             filename=file.filename,
-            chunk_count=len(valid_texts),
-            parsed_content=valid_texts,  # 存入新增的字段
+            chunk_count=0,  # 0 表示正在后台解析中
             upload_time=datetime.now()
         )
         db.add(new_doc)
         db.commit()
+        db.refresh(new_doc)
 
-        return {"status": "success", "message": f"成功解析并存入 {len(valid_texts)} 条高质量语义块"}
+        # 3. 将解析任务推入后台队列！
+        background_tasks.add_task(service.async_process_and_store, file_save_path, ext, new_doc.id)
+
+        # 4. 瞬间响应前端
+        return {
+            "status": "processing",
+            "message": f"文件 [{file.filename}] 已提交后台排队解析！此过程可能需要几分钟，请稍后刷新列表查看进度。"
+        }
+
     except Exception as e:
-        logger.error(f"上传失败: {e}")
+        logger.error(f"上传分发失败: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 

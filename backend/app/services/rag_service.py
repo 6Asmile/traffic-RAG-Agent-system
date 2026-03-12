@@ -1,38 +1,35 @@
 # app/services/rag_service.py
-
 import json
 import logging
 import os
 import re
 import shutil
+import tempfile
+import time
 from typing import List
-from docling.document_converter import DocumentConverter
-from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
+
 import httpx
 import jieba
+from docling.document_converter import DocumentConverter
 # 引入更强的 PDF 解析器
-from langchain_community.document_loaders import PDFPlumberLoader, TextLoader, Docx2txtLoader
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 from langchain_core.messages import HumanMessage, ToolMessage, AIMessage, SystemMessage
 from langchain_openai import ChatOpenAI
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
+from pypdf import PdfReader, PdfWriter
 from rank_bm25 import BM25Okapi
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
-from app.core.prompts import RAG_SYSTEM_PROMPT, QUERY_REWRITE_PROMPT,AGENT_SYSTEM_PROMP
+from app.core.prompts import RAG_SYSTEM_PROMPT, QUERY_REWRITE_PROMPT
+from app.db.session import SessionLocal
 from app.models import User
 from app.models.knowledge import KnowledgeDoc
 from app.services.cache_service import CacheManager
 from app.services.config_service import ConfigService
 from app.services.tool_service import agent_get_route, agent_search_nearby, agent_get_weather
-from docling.document_converter import DocumentConverter, PdfFormatOption
-from docling.datamodel.base_models import InputFormat
-from docling.datamodel.pipeline_options import PdfPipelineOptions
-from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
-import re
 
 os.environ["ANONYMIZED_TELEMETRY"] = "False"
 logger = logging.getLogger("RAGService")
@@ -45,19 +42,39 @@ class AliyunEmbeddingWrapper(Embeddings):
 
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
         results = []
-        with httpx.Client(timeout=60.0) as client:
+        # 加大超时时间，并配置连接池限制
+        limits = httpx.Limits(max_keepalive_connections=5, max_connections=10)
+        with httpx.Client(timeout=120.0, limits=limits) as client:
             for i in range(0, len(texts), 10):
                 batch = [str(t) for t in texts[i: i + 10]]
                 payload = {"model": self.model, "input": batch}
                 headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
-                resp = client.post(self.url, json=payload, headers=headers)
-                if resp.status_code != 200:
-                    raise Exception(f"Embedding API Error: {resp.text}")
-                data = resp.json()
-                results.extend([item["embedding"] for item in data["data"]])
+
+                # ==========================================
+                # ✨ 核心修复：加入 3 次重试机制与网络退避策略
+                # ==========================================
+                max_retries = 3
+                for attempt in range(max_retries):
+                    try:
+                        resp = client.post(self.url, json=payload, headers=headers)
+                        if resp.status_code != 200:
+                            raise Exception(f"Embedding API Error: {resp.status_code} - {resp.text}")
+                        data = resp.json()
+                        results.extend([item["embedding"] for item in data["data"]])
+                        break  # 如果成功，跳出重试循环
+                    except Exception as e:
+                        logger.warning(f"⚠️ 阿里云 Embedding 请求断开 (尝试 {attempt + 1}/{max_retries}): {e}")
+                        if attempt == max_retries - 1:
+                            raise Exception(f"Embedding 最终失败: {e}")
+                        time.sleep(2)  # 失败后休息 2 秒再重试
+
+                # 每发完一批请求，强制让程序休息 0.5 秒，绝不触发阿里云的并发限制！
+                time.sleep(0.5)
+
         return results
 
     def embed_query(self, text: str) -> List[float]:
+        # 查询时因为只有1条，也复用上面的重试逻辑
         return self.embed_documents([text])[0]
 
 
@@ -208,69 +225,114 @@ class RAGService:
         except Exception as e:
             logger.error(f"BM25 初始化失败: {e}")
 
-    def _process_document_advanced(self, file_path: str) -> list:
+    def _process_document_advanced(self, file_path: str, ext: str) -> list:
         """
-        内存优化版解析管线：通过限制并发与视觉管道选项，降低大文件的内存峰值。
+        防 OOM 版文档解析：针对长 PDF 进行【物理分页剥离】处理
         """
-        print(f"👁️ [Docling] 启动内存优化型解析管线: {file_path}")
+        print(f"👁️ [Docling] 启动视觉大模型解析: {file_path}")
+        md_text = ""
+        converter = DocumentConverter()
 
-        # 1. 配置优化：限制资源消耗
-        pipeline_options = PdfPipelineOptions()
-        pipeline_options.do_table_structure = True  # 保持表格解析
-        pipeline_options.do_ocr = True  # 若是扫描件则开启 OCR
+        if ext == 'pdf':
+            # === PDF 防爆内存处理：每次只处理 5 页 ===
+            reader = PdfReader(file_path)
+            total_pages = len(reader.pages)
+            batch_size = 20  # 每次处理5页，完美控制内存
 
-        # 【核心内存优化】：限制图片分辨率和并发页处理
-        # 这会显著降低内存占用，对于几十MB的大文件非常有效
-        pipeline_options.images_scale = 1.0
+            print(f"📄 PDF 共 {total_pages} 页，将分 {(total_pages // batch_size) + 1} 批进行解析...")
 
-        converter = DocumentConverter(
-            format_options={
-                InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)
-            }
-        )
+            for i in range(0, total_pages, batch_size):
+                writer = PdfWriter()
+                # 截取 5 页
+                for j in range(i, min(i + batch_size, total_pages)):
+                    writer.add_page(reader.pages[j])
 
-        # 2. 执行转换
-        # 大文件建议不要在这里直接转 Markdown 全量字符串，Docling 内部会处理资源
-        result = converter.convert(file_path)
+                # 写入临时文件
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                    writer.write(tmp.name)
+                    tmp_path = tmp.name
 
-        # 3. 语义切分逻辑 (保持你要求的富化逻辑)
-        # 将 docling 文档导出为 markdown
-        md_text = result.document.export_to_markdown()
+                try:
+                    # 依次将小切片喂给 Docling
+                    result = converter.convert(tmp_path)
+                    md_text += result.document.export_to_markdown() + "\n\n"
+                    print(f"   ⏳ 进度：已解析 {min(i + batch_size, total_pages)} / {total_pages} 页")
+                finally:
+                    # 阅后即焚，释放硬盘
+                    if os.path.exists(tmp_path):
+                        os.remove(tmp_path)
+        else:
+            # === DOCX / TXT / MD 通常不会内存溢出，直接解析 ===
+            result = converter.convert(file_path)
+            md_text = result.document.export_to_markdown()
 
-        # 4. 语义层级分块
-        headers_to_split_on = [
-            ("#", "章"), ("##", "节"), ("###", "条"), ("####", "款"),
-        ]
+        # ----------------------------------------------------
+        # 下面是原有的 Markdown 切分与上下文富化逻辑（不变）
+        # ----------------------------------------------------
+        headers_to_split_on = [("#", "章"), ("##", "节"), ("###", "条"), ("####", "款")]
         md_splitter = MarkdownHeaderTextSplitter(headers_to_split_on=headers_to_split_on, strip_headers=False)
-
-        # 注意：如果文件巨大，这里 split_text 依然吃内存。
-        # 如果文件超大，建议在此处切分 md_text，按行读取后再合并
         md_splits = md_splitter.split_text(md_text)
 
         text_splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=150)
         final_splits = text_splitter.split_documents(md_splits)
 
         valid_texts = []
-        # 5. 上下文富化
         for split in final_splits:
-            hierarchy = []
-            for h in ["章", "节", "条", "款"]:
-                if h in split.metadata:
-                    hierarchy.append(split.metadata[h])
-
+            hierarchy = [split.metadata[h] for h in ["章", "节", "条", "款"] if h in split.metadata]
             path_str = " > ".join(hierarchy) if hierarchy else "正文内容"
-            content = re.sub(r'[\x00-\x08\x0b-\x0c\x0e-\x1f\x7f]', '', split.page_content.strip())
+
+            import re
+            content = split.page_content.strip()
+            content = re.sub(r'[\x00-\x08\x0b-\x0c\x0e-\x1f\x7f]', '', content)
 
             if len(content) < 15: continue
 
             enriched_text = f"【所属章节】: {path_str}\n【条款内容】:\n{content}"
             valid_texts.append(enriched_text)
 
-        print(f"✅ [解析完成] 大文件解析结束，提取 {len(valid_texts)} 个语义富化块。")
-        # 显式清理
-        del result
+        print(f"✅[解析完成] 共提取 {len(valid_texts)} 个语义富化块。")
         return valid_texts
 
+    def async_process_and_store(self, file_path: str, ext: str, doc_id: int):
+        """
+        专供后台 Task 调用的异步处理函数
+        """
+        # 因为在后台运行，必须重新开启数据库连接
+        db = SessionLocal()
+        try:
+            # 1. 深度解析
+            valid_texts = self._process_document_advanced(file_path, ext)
+            if not valid_texts:
+                logger.warning(f"文档 {doc_id} 未提取到有效文本")
+                return
+
+            # 2. 存入 FAISS 向量库
+            if self.vector_db is None:
+                self.vector_db = FAISS.from_texts(valid_texts, self.custom_embeddings)
+            else:
+                self.vector_db.add_texts(valid_texts)
+            self.vector_db.save_local(self.index_path)
+
+            # 3. 热更新 BM25
+            self.bm25_corpus.extend(valid_texts)
+            import jieba
+            from rank_bm25 import BM25Okapi
+            tokenized_corpus = [list(jieba.cut(text)) for text in self.bm25_corpus]
+            self.bm25_instance = BM25Okapi(tokenized_corpus)
+
+            # 4. 更新数据库记录
+            from app.models.knowledge import KnowledgeDoc
+            doc = db.query(KnowledgeDoc).filter_by(id=doc_id).first()
+            if doc:
+                doc.chunk_count = len(valid_texts)
+                doc.parsed_content = valid_texts
+                db.commit()
+                logger.info(f"🎉 异步任务完成！文档ID:{doc_id} 已成功存入 {len(valid_texts)} 个切片。")
+
+        except Exception as e:
+            logger.error(f"❌ 异步解析任务崩溃: {e}")
+        finally:
+            db.close()
     def ingest_knowledge(self, file_upload_object, filename: str) -> list:
         print(f"\n🚀 [知识入库] 接收文件: {filename}")
 
@@ -313,7 +375,7 @@ class RAGService:
         query = self.strict_clean(query)
         q_vec = self.custom_embeddings.embed_query(query)
 
-        # 1. 语义缓存检查
+        # 1. 语义缓存检查   //开发状态可以先注释掉 正常部署使用时弄回来
         cached_ans, cached_src = self.cache.get_semantic_cache(q_vec)
         # if cached_ans:
         #     print("⚡ [缓存命中] 直接返回历史答案")
