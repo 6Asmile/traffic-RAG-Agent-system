@@ -6,24 +6,25 @@
     <div v-if="loading" class="loading-container">
       <div class="loader-content">
         <el-icon class="is-loading" :size="48" color="#fff"><Loading /></el-icon>
-        <p>AI 考官正在出题中...</p>
+        <p>AI 考官正在为您生成专属考题...</p>
       </div>
     </div>
 
     <!-- 答题卡片容器 -->
     <div class="glass-card quiz-card" v-else-if="!finished && currentQuestion">
       
-      <!-- 1. 顶部固定区：增加返回按钮 -->
+      <!-- 1. 顶部固定区 -->
       <div class="quiz-header">
         <div class="header-top">
-          <!-- 新增：返回按钮 -->
+          <!-- 返回按钮 -->
           <div class="left-action" @click="handleExit">
             <el-icon :size="22"><ArrowLeftBold /></el-icon>
           </div>
 
           <div class="badge-group">
             <span class="tag-badge">每日一练</span>
-            <span class="difficulty">难度 ⭐⭐⭐</span>
+            <!-- 【核心修改】难度根据题目自带属性动态渲染星星 -->
+            <span class="difficulty">难度 {{ '⭐'.repeat(currentQuestion.difficulty || 3) }}</span>
           </div>
           
           <span class="step-indicator">{{ currentIndex + 1 }} / {{ questions.length }}</span>
@@ -50,7 +51,6 @@
             @click="selectOption(idx)"
           >
             <div class="opt-letter">
-              <!-- 加载中显示转圈，否则显示字母 -->
               <el-icon v-if="isSubmitting && currentQuestion.user_selected === getOptionLabel(idx)" class="is-loading">
                 <Loading />
               </el-icon>
@@ -120,7 +120,7 @@
 
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue';
-import { useRouter } from 'vue-router'; // 引入 useRouter
+import { useRouter } from 'vue-router';
 import { Loading, CircleCheckFilled, CircleCloseFilled, ArrowRight, ArrowLeftBold, Reading } from '@element-plus/icons-vue';
 import { ElMessage, ElMessageBox } from 'element-plus';
 import request from '../api/request';
@@ -133,6 +133,7 @@ interface Question {
   options: string[];
   correct_answer: string;
   explanation: string;
+  difficulty: number; // 确保接口里包含难度字段
   user_selected?: string;
 }
 
@@ -143,7 +144,7 @@ const isCorrect = ref(false);
 const score = ref(0);
 const finished = ref(false);
 const loading = ref(true);
-const isSubmitting = ref(false); // 新增：防止重复提交锁
+const isSubmitting = ref(false); 
 
 const currentQuestion = computed(() => {
   if (questions.value.length === 0) return null;
@@ -157,14 +158,14 @@ const loadQuestions = async () => {
   score.value = 0;
   showResult.value = false;
   isSubmitting.value = false;
-  questions.value = [];
+  questions.value =[];
 
   try {
     const res = await request.get('/v1/quiz/daily');
     questions.value = res.data;
   } catch (e) {
-    ElMessage.error('题目生成失败，请稍后再试');
-    router.push('/'); // 失败直接退回主页
+    ElMessage.error('获取题目失败，请检查网络');
+    router.push('/'); 
   } finally {
     loading.value = false;
   }
@@ -174,14 +175,12 @@ onMounted(loadQuestions);
 
 const getOptionLabel = (idx: number) => String.fromCharCode(65 + idx);
 
-// 核心优化：选中选项
 const selectOption = async (idx: number) => {
-  // 增加 isSubmitting 判断，防止连点
   if (showResult.value || !currentQuestion.value || isSubmitting.value) return; 
   
   const optionLabel = getOptionLabel(idx);
   currentQuestion.value.user_selected = optionLabel;
-  isSubmitting.value = true; // 加锁
+  isSubmitting.value = true; 
 
   try {
     const res = await request.post('/v1/quiz/submit', {
@@ -190,20 +189,21 @@ const selectOption = async (idx: number) => {
     });
     
     isCorrect.value = res.data.is_correct;
-    if (isCorrect.value) score.value += 20;
+    
+    // 【核心修改】因为改成了 10 题，所以每题分值变为 10 分
+    if (isCorrect.value) score.value += 10; 
+    
     showResult.value = true;
     
-    // 自动滚动
     setTimeout(() => {
       const body = document.querySelector('.quiz-body');
       if (body) body.scrollTo({ top: body.scrollHeight, behavior: 'smooth' });
     }, 100);
 
   } catch (e) {
-    ElMessage.error('提交失败，请检查网络');
-    // 如果失败，允许用户重试，所以要解锁，但不要设置 showResult
+    ElMessage.error('提交失败，请重试');
   } finally {
-    isSubmitting.value = false; // 解锁
+    isSubmitting.value = false; 
   }
 };
 
@@ -250,11 +250,12 @@ const getOptionClass = (idx: number) => {
   return 'disabled';
 };
 
+// 【核心修改】调整 10 道题的评语阈值
 const getComment = (s: number) => {
-  if (s == 100) return "太棒了！你是交通法专家！🏆";
-  if (s >= 80) return "成绩不错，继续保持！🚗";
-  if (s >= 60) return "及格了，有些盲区要注意哦。🚦";
-  return "看来还需要多看看法规知识库呀。📚";
+  if (s === 100) return "满分通关！您就是活着的交规词典！🏆";
+  if (s >= 80) return "成绩优秀，只有极少数知识盲区！🚗";
+  if (s >= 60) return "及格了，但上路前还需多加复习哦。🚦";
+  return "马路杀手警告！建议去知识库多看看法条。📚";
 };
 </script>
 

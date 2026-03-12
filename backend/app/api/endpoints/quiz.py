@@ -32,7 +32,7 @@ class AnswerRequest(BaseModel):
 # ==========================================
 # ✨ 核心：后台异步出题任务 ✨
 # ==========================================
-async def run_quiz_generation(count: int = 5):
+async def run_quiz_generation(count: int = 10):
     """独立的后台任务：动态读取配置并调用 LLM 出题"""
     db = SessionLocal()
     try:
@@ -83,16 +83,16 @@ async def get_daily_quiz(
     query = db.query(Question)
     if answered_ids:
         query = query.filter(Question.id.not_in(answered_ids))
-    unanswered_questions = query.order_by(func.random()).limit(5).all()
+    unanswered_questions = query.order_by(func.random()).limit(10).all()
 
     # 3. ✨ 优雅降级：如果没做过的题目不足 5 道，后台自动补题，前端不阻塞！
-    if len(unanswered_questions) < 5:
+    if len(unanswered_questions) < 10:
         logger.info(f"用户 {current_user.username} 的新题库不足，后台自动紧急补题...")
         # 抛给后台去出题，接口继续往下走
-        background_tasks.add_task(run_quiz_generation, 5)
+        background_tasks.add_task(run_quiz_generation, 10)
 
         # 为了不让前端报错，拿几道旧题凑齐 5 道当做“错题复习”
-        shortage = 5 - len(unanswered_questions)
+        shortage = 10 - len(unanswered_questions)
         if answered_ids:
             old_questions = db.query(Question).filter(Question.id.in_(answered_ids)).order_by(func.random()).limit(
                 shortage).all()
@@ -100,7 +100,7 @@ async def get_daily_quiz(
 
     # 如果连旧题都没有（知识库刚建好的极端情况），就兜底随便取5道
     if not unanswered_questions:
-        unanswered_questions = db.query(Question).order_by(func.random()).limit(5).all()
+        unanswered_questions = db.query(Question).order_by(func.random()).limit(10).all()
 
     return unanswered_questions
 
@@ -158,5 +158,5 @@ async def admin_generate_quiz(
         raise HTTPException(403, "权限不足")
 
     # 丢给后台执行，立即响应前端
-    background_tasks.add_task(run_quiz_generation, 5)
+    background_tasks.add_task(run_quiz_generation, 10)
     return {"status": "processing", "message": "题库生成任务已在后台启动，处理约需1-2分钟。"}

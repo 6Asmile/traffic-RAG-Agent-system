@@ -2,7 +2,7 @@
   <div class="admin-page">
     <div class="bg-glow"></div>
     <div class="glass-card custom-scrollbar">
-      <!-- 1. 标题与上传区域：适配移动端自动换行 -->
+      <!-- 1. 标题与上传区域 -->
       <header class="admin-header">
         <div class="title-section">
           <el-icon :size="28" color="#409eff"><Collection /></el-icon>
@@ -13,27 +13,46 @@
           :headers="headers" 
           :on-success="onUploadSuccess" 
           :show-file-list="false"
-          accept=".pdf, .txt, .docx"
+          accept=".pdf, .txt, .docx, .md"
           class="upload-btn-wrapper"
         >
           <el-button type="primary" :icon="Plus" round>上传法规</el-button>
         </el-upload>
       </header>
 
-      <!-- 2. 知识库列表表格：增加高度限制并允许内部滚动 -->
+      <!-- 2. 知识库列表表格 -->
       <div class="table-wrapper">
         <el-table :data="docs" style="width: 100%" class="modern-table" size="small">
           <el-table-column prop="filename" label="文件名" min-width="180" show-overflow-tooltip />
-          <el-table-column prop="chunk_count" label="切片" width="60" align="center" />
-          <!-- 移动端隐藏上传时间列以节省空间，或者缩窄 -->
+          
+          <!-- 【核心修改】判断 chunk_count，如果是 0 显示解析中，否则显示具体数字 -->
+          <el-table-column label="切片状态" width="100" align="center">
+            <template #default="scope">
+              <el-tag v-if="scope.row.chunk_count === 0" type="warning" effect="light" size="small">
+                <el-icon class="is-loading"><Loading /></el-icon> 解析中
+              </el-tag>
+              <el-tag v-else type="success" effect="plain" size="small">
+                {{ scope.row.chunk_count }} 块
+              </el-tag>
+            </template>
+          </el-table-column>
+
+          <!-- 移动端隐藏上传时间列以节省空间 -->
           <el-table-column prop="upload_time" label="日期" width="100" align="center" class-name="hidden-xs">
             <template #default="scope">
               {{ formatShortDate(scope.row.upload_time) }}
             </template>
           </el-table-column>
+          
           <el-table-column label="操作" width="80" align="center">
             <template #default="scope">
-              <el-button type="danger" link @click="handleDelete(scope.row)">
+              <!-- 加入防呆设计：如果在解析中，不允许删除，防止后台线程崩溃 -->
+              <el-button 
+                type="danger" 
+                link 
+                @click="handleDelete(scope.row)" 
+                :disabled="scope.row.chunk_count === 0"
+              >
                 <el-icon><Delete /></el-icon>
               </el-button>
             </template>
@@ -41,21 +60,19 @@
         </el-table>
       </div>
 
-      <!-- 3. 数据分析看板区域：使用响应式栅格 -->
+      <!-- 3. 数据分析看板区域 -->
       <div class="analytics-dashboard">
         <el-divider content-position="left">
           <el-icon><PieChart /></el-icon> 热点分析
         </el-divider>
 
         <el-row :gutter="20">
-          <!-- 左侧：ECharts 环形图。在手机上占 24 格（全宽），电脑上占 10 格 -->
           <el-col :xs="24" :sm="10">
             <div class="inner-card chart-box">
               <div ref="chartRef" class="echarts-container"></div>
             </div>
           </el-col>
 
-          <!-- 右侧：AI 热点话题列表。在手机上占 24 格，电脑上占 14 格 -->
           <el-col :xs="24" :sm="14">
             <div class="inner-card topic-list">
               <h3>🔥 智能识别热点话题</h3>
@@ -79,37 +96,39 @@
         </el-row>
 
         <div class="action-bar">
+          <!-- 刷新按钮也用来刷新列表状态 -->
+          <el-button type="default" @click="fetchDocs" round>
+            <el-icon><RefreshRight /></el-icon> 刷新列表状态
+          </el-button>
           <el-button type="primary" :loading="analyzing" @click="startAnalysis" round>
-            <el-icon v-if="!analyzing"><Refresh /></el-icon> 重新分析
+            <el-icon v-if="!analyzing"><Refresh /></el-icon> 重新分析热点
           </el-button>
         </div>
       </div>
-       <div class="admin-actions-grid">
-          <!-- 知识图谱构建 -->
-          <el-card class="admin-card">
-            <h3>图谱管理</h3>
-            <p>从最新 AI 回答中提取知识链路</p>
-            <el-button type="success" :icon="Share" @click="handleBuildGraph" :loading="loadingGraph">
-              更新知识图谱
-            </el-button>
-          </el-card>
 
-          <!-- 每日一练生成 -->
-          <el-card class="admin-card">
-            <h3>题库管理</h3>
-            <p>强制触发 AI 生成新的每日一练题目</p>
-            <el-button type="warning" :icon="Edit" @click="handleGenerateQuiz" :loading="loadingQuiz">
-              生成新题目
-            </el-button>
-          </el-card>
-        </div>
+      <div class="admin-actions-grid">
+        <el-card class="admin-card">
+          <h3>图谱管理</h3>
+          <p>从最新 AI 回答中提取知识链路</p>
+          <el-button type="success" :icon="Share" @click="handleBuildGraph" :loading="loadingGraph">
+            更新知识图谱
+          </el-button>
+        </el-card>
+
+        <el-card class="admin-card">
+          <h3>题库管理</h3>
+          <p>强制触发 AI 生成新的每日一练题目</p>
+          <el-button type="warning" :icon="Edit" @click="handleGenerateQuiz" :loading="loadingQuiz">
+            生成新题目
+          </el-button>
+        </el-card>
+      </div>
+
       <!-- 4. 底部状态栏 -->
       <footer class="admin-footer">
         <div class="stat-item">
-          <span class="label">总切片:</span>
+          <span class="label">当前有效总切片:</span>
           <span class="value">{{ totalChunks }}</span>
-          <!-- 修改跳转路径 -->
-  
         </div>
         <el-button @click="$router.push('/')" link :icon="HomeFilled">返回系统首页</el-button>
       </footer>
@@ -119,14 +138,14 @@
 
 <script setup lang="ts">
 import { ref, onMounted, computed, nextTick } from 'vue';
-import {Plus, Collection, Delete, PieChart, Refresh, Share, Edit } from '@element-plus/icons-vue';
+import {Plus, Collection, Delete, PieChart, Refresh, Share, Edit, Loading, RefreshRight, HomeFilled } from '@element-plus/icons-vue';
 import { ElMessage, ElMessageBox } from 'element-plus';
-import { HomeFilled } from '@element-plus/icons-vue';
 import request from '../api/request';
 import * as echarts from 'echarts';
 import { API_BASE_URL } from '../api/config';
+
 const uploadUrl = computed(() => `${API_BASE_URL}/v1/chat/upload`);
-// --- 类型接口定义 ---
+
 interface DocItem {
   id: number;
   filename: string;
@@ -142,7 +161,6 @@ interface HotTopic {
   representative_queries: string[];
 }
 
-// --- 响应式变量 ---
 const docs = ref<DocItem[]>([]);
 const hotTopics = ref<HotTopic[]>([]);
 const chartRef = ref<HTMLElement | null>(null);
@@ -151,15 +169,13 @@ const headers = { Authorization: `Bearer ${localStorage.getItem('access_token')}
 const loadingGraph = ref(false);
 const loadingQuiz = ref(false);
 
-// --- ECharts 初始化 ---
 const initChart = (data: { topic: string; count: number }[]) => {
   if (!chartRef.value || !data.length) return;
-  
   const myChart = echarts.init(chartRef.value);
   const option = {
     title: { text: '咨询热点分布', left: 'center', textStyle: { fontSize: 14 } },
     tooltip: { trigger: 'item', formatter: '{b}: {c}' },
-    series: [
+    series:[
       {
         type: 'pie',
         radius: ['40%', '70%'],
@@ -174,7 +190,6 @@ const initChart = (data: { topic: string; count: number }[]) => {
   window.addEventListener('resize', () => myChart.resize());
 };
 
-// --- API 调用 ---
 const fetchHotTopics = async () => {
   try {
     const res = await request.get('/v1/chat/analytics');
@@ -211,8 +226,18 @@ const startAnalysis = async () => {
   }
 };
 
-const onUploadSuccess = () => {
-  ElMessage.success('上传成功');
+// 【核心修改】处理上传成功后的反馈
+const onUploadSuccess = (response: any) => {
+  if (response.status === 'processing') {
+    // 后端返回 processing，说明已进入后台队列
+    ElMessage.success({
+      message: response.message || '文件已放入后台解析队列',
+      duration: 4000
+    });
+  } else {
+    ElMessage.success('上传并解析成功');
+  }
+  // 无论哪种情况，立刻刷新列表，把 chunk_count = 0 的记录展示出来
   fetchDocs();
 };
 
@@ -227,19 +252,12 @@ const handleDelete = async (row: DocItem) => {
 
 const handleBuildGraph = async () => {
   loadingGraph.value = true;
-  
-  // 提示用户：任务已启动
   ElMessage.info('图谱更新任务已在后台启动，处理约需 1-2 分钟...');
-  
   try {
-    // 此时请求会瞬间返回
     await request.post('/v1/chat/build_graph');
-    
-    // 你可以添加一个定时器，过一会刷新页面，或者让用户手动刷新
     setTimeout(() => {
         ElMessage.success('后台正在处理中，稍后请刷新页面查看变化');
     }, 2000);
-    
   } catch (e) { 
     ElMessage.error('任务启动失败'); 
   } finally {
@@ -249,10 +267,7 @@ const handleBuildGraph = async () => {
 
 const handleGenerateQuiz = async () => {
   loadingQuiz.value = true;
-  
-  // 提前告诉用户已经在后台跑了
   ElMessage.info('题库生成任务已在后台启动，处理约需 1-2 分钟...');
-  
   try {
     await request.post('/v1/quiz/admin_generate');
     setTimeout(() => {
@@ -265,7 +280,7 @@ const handleGenerateQuiz = async () => {
   }
 };
 
-// --- 辅助计算 ---
+// 辅助计算
 const totalChunks = computed(() => docs.value.reduce((acc, cur) => acc + cur.chunk_count, 0));
 const formatShortDate = (t: string) => {
   const d = new Date(t);

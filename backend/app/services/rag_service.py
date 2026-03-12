@@ -23,7 +23,7 @@ from rank_bm25 import BM25Okapi
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
-from app.core.prompts import RAG_SYSTEM_PROMPT, QUERY_REWRITE_PROMPT
+from app.core.prompts import RAG_SYSTEM_PROMPT, QUERY_REWRITE_PROMPT,AGENT_SYSTEM_PROMPT
 from app.db.session import SessionLocal
 from app.models import User
 from app.models.knowledge import KnowledgeDoc
@@ -460,15 +460,7 @@ class RAGService:
             print("🤖 [Agent] 正在思考...")
 
             # 定义 System Prompt，强行压制模型输出 XML 标签
-            agent_system_prompt = SystemMessage(content="""
-            你是一个集成了高德地图能力的智能交通助手。
-            
-            【核心指令】
-            1. 当用户询问路线、地点、天气时，**必须**调用工具。
-            2. 工具调用完成后，请根据工具返回的数据，用**自然语言**生成一段温馨、有用的建议。
-            3. **严禁**输出任何 XML标签、JSON代码块或 `< | DSML | ... >` 这样的调试信息。只输出给用户看的最终文字。
-            4. 如果工具返回了图片链接，请不要在回答中重复生成该链接，以免图片显示两次。
-            """)
+            agent_system_prompt = SystemMessage(content=AGENT_SYSTEM_PROMPT)
 
             tools = [agent_get_route, agent_search_nearby, agent_get_weather]
             llm_with_tools = self.rewriter_llm.bind_tools(tools)
