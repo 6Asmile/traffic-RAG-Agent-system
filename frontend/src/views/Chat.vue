@@ -157,11 +157,12 @@
                       <span class="src-link"><el-icon><Document /></el-icon> 引用依据</span>
                     </template>
                     <div class="source-scroll-container">
-                      <div v-for="(s, i) in msg.sources" :key="i" class="src-item-card">
-                        <div class="src-label">依据 {{ i + 1 }}</div>
-                        <div class="src-text">{{ s }}</div>
-                      </div>
-                    </div>
+  <div v-for="(s, i) in msg.sources" :key="i" class="src-item-card">
+    <div class="src-label">依据 {{ i + 1 }}</div>
+    <!-- 使用 v-html 结合 renderMarkdown 方法来渲染含有 markdown 格式的字符串 -->
+    <div class="src-text markdown-body" v-html="renderMarkdown(s)"></div>
+  </div>
+</div>
                   </el-popover>
                 </div>
               </div>
@@ -588,13 +589,49 @@ const deleteSession = async (id: string) => {
 
 /* --- 滚动条修复 --- */
 .source-scroll-container {
-  max-height: 380px; overflow-y: auto !important; padding-right: 8px;
+  max-height: 450px; /* 稍微增高一点，因为带有换行的 Markdown 占地更大 */
+  overflow-y: auto !important; 
+  padding-right: 8px;
   &::-webkit-scrollbar { width: 5px; display: block !important; }
   &::-webkit-scrollbar-thumb { background: #ddd; border-radius: 10px; }
+  
   .src-item-card {
-    background: #f8f9fa; padding: 12px; border-radius: 8px; margin-bottom: 10px; border: 1px solid #eee;
-    .src-label { color: #409eff; font-weight: bold; font-size: 12px; margin-bottom: 4px; }
-    .src-text { font-size: 13px; color: #666; line-height: 1.5; }
+    background: #f8f9fa; 
+    padding: 15px; 
+    border-radius: 10px; 
+    margin-bottom: 12px; 
+    border: 1px solid #e4e7ed;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.02);
+    
+    .src-label { 
+      color: #409eff; 
+      font-weight: 800; 
+      font-size: 13px; 
+      margin-bottom: 8px; 
+      border-bottom: 1px solid #eee; 
+      padding-bottom: 5px;
+    }
+    
+    /* 强行约束内部 Markdown 样式，使其紧凑美观。使用 :deep 穿透 scoped 限制 */
+    .src-text { 
+      font-size: 12.5px; 
+      color: #555; 
+      line-height: 1.6;
+      :deep(p) { margin-bottom: 6px; }
+      :deep(h1), :deep(h2), :deep(h3), :deep(h4) { 
+        font-size: 13.5px; font-weight: bold; margin: 8px 0 4px; color: #333;
+      }
+      :deep(ul), :deep(ol) { padding-left: 18px; margin-bottom: 6px; }
+      :deep(li) { margin-bottom: 3px; }
+      /* 隐藏图表错位产生的多余换行 */
+      :deep(br) { content: ""; display: block; margin-top: 2px; }
+      /* 优化表格显示（如果Docling提取了表格） */
+      :deep(table) {
+        width: 100%; border-collapse: collapse; margin-bottom: 6px;
+        th, td { border: 1px solid #ddd; padding: 4px 8px; text-align: left; }
+        th { background-color: #f0f2f5; }
+      }
+    }
   }
 }
 

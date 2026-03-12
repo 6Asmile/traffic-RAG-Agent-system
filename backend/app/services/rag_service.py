@@ -228,16 +228,21 @@ class RAGService:
     def _process_document_advanced(self, file_path: str, ext: str) -> list:
         """
         防 OOM 版文档解析：针对长 PDF 进行【物理分页剥离】处理
+        针对 TXT 进行【原生极速读取】绕过视觉模型
         """
-        print(f"👁️ [Docling] 启动视觉大模型解析: {file_path}")
+        print(f"👁️ [解析路由] 启动文档解析: {file_path} (格式: {ext})")
         md_text = ""
-        converter = DocumentConverter()
 
         if ext == 'pdf':
             # === PDF 防爆内存处理：每次只处理 5 页 ===
+            from docling.document_converter import DocumentConverter
+            converter = DocumentConverter()
+            from pypdf import PdfReader, PdfWriter
+            import tempfile
+
             reader = PdfReader(file_path)
             total_pages = len(reader.pages)
-            batch_size = 20  # 每次处理5页，完美控制内存
+            batch_size = 10  # 每次处理5页，完美控制内存
 
             print(f"📄 PDF 共 {total_pages} 页，将分 {(total_pages // batch_size) + 1} 批进行解析...")
 
@@ -261,16 +266,33 @@ class RAGService:
                     # 阅后即焚，释放硬盘
                     if os.path.exists(tmp_path):
                         os.remove(tmp_path)
+
+        elif ext == 'txt':
+            # === TXT 文件：直接原生极速读取，不走 Docling 视觉模型 ===
+            print("📄 检测到 TXT 文件，采用极速纯文本读取...")
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    md_text = f.read()
+            except UnicodeDecodeError:
+                # 兼容 Windows 常见的 GBK 编码格式
+                with open(file_path, 'r', encoding='gbk') as f:
+                    md_text = f.read()
+
         else:
-            # === DOCX / TXT / MD 通常不会内存溢出，直接解析 ===
+            # === DOCX / MD 通常不会内存溢出，且格式在允许列表内，交由 Docling 直接解析 ===
+            from docling.document_converter import DocumentConverter
+            converter = DocumentConverter()
             result = converter.convert(file_path)
             md_text = result.document.export_to_markdown()
 
         # ----------------------------------------------------
         # 下面是原有的 Markdown 切分与上下文富化逻辑（不变）
         # ----------------------------------------------------
+        from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
         headers_to_split_on = [("#", "章"), ("##", "节"), ("###", "条"), ("####", "款")]
         md_splitter = MarkdownHeaderTextSplitter(headers_to_split_on=headers_to_split_on, strip_headers=False)
+
+        # 无论是 PDF 还是 TXT，此时都已经变成了文本字符串，直接切分
         md_splits = md_splitter.split_text(md_text)
 
         text_splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=150)
@@ -279,15 +301,24 @@ class RAGService:
         valid_texts = []
         for split in final_splits:
             hierarchy = [split.metadata[h] for h in ["章", "节", "条", "款"] if h in split.metadata]
-            path_str = " > ".join(hierarchy) if hierarchy else "正文内容"
+            path_str = " > ".join(hierarchy) if hierarchy else "通用正文"
 
             import re
             content = split.page_content.strip()
+
+            # 过滤目录页等污染数据
+            if "目 次" in path_str or "........" in content:
+                continue
+
             content = re.sub(r'[\x00-\x08\x0b-\x0c\x0e-\x1f\x7f]', '', content)
 
             if len(content) < 15: continue
 
-            enriched_text = f"【所属章节】: {path_str}\n【条款内容】:\n{content}"
+            # 提取条款号（匹配“第一条”“第二条”等）
+            clause_match = re.search(r'第[\u4e00-\u9fa5\d]+条', content)
+            clause_num = clause_match.group() if clause_match else "明细条款"
+
+            enriched_text = f"【章节】: {path_str} | 【{clause_num}】\n{content}"
             valid_texts.append(enriched_text)
 
         print(f"✅[解析完成] 共提取 {len(valid_texts)} 个语义富化块。")
@@ -376,7 +407,7 @@ class RAGService:
         q_vec = self.custom_embeddings.embed_query(query)
 
         # 1. 语义缓存检查   //开发状态可以先注释掉 正常部署使用时弄回来
-        cached_ans, cached_src = self.cache.get_semantic_cache(q_vec)
+        # cached_ans, cached_src = self.cache.get_semantic_cache(q_vec)
         # if cached_ans:
         #     print("⚡ [缓存命中] 直接返回历史答案")
         #     yield json.dumps({"type": "sources", "data": cached_src})
