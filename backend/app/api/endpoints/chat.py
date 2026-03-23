@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+import shutil
 from datetime import datetime
 from typing import Optional
 from fastapi import APIRouter, UploadFile, File, Depends, HTTPException, BackgroundTasks
@@ -152,6 +153,46 @@ def get_me(current_user: User = Depends(get_current_user)):
     return {"username": current_user.username, "avatar": current_user.avatar, "role": current_user.role,
             "created_at": current_user.created_at.strftime("%Y-%m-%d") if current_user.created_at else "2025-01-01"}
 
+
+@router.post("/upload_avatar")
+async def upload_avatar(
+        file: UploadFile = File(...),
+        db: Session = Depends(get_db),
+        current_user: User = Depends(get_current_user)
+):
+    """处理用户头像上传"""
+    allowed_exts = ['jpg', 'jpeg', 'png', 'gif', 'webp']
+    ext = file.filename.split('.')[-1].lower()
+
+    if ext not in allowed_exts:
+        raise HTTPException(status_code=400, detail=f"仅支持 {allowed_exts} 图片格式")
+
+    # 保存目录: data/uploads/avatars
+    avatar_dir = os.path.join(settings.BASE_DIR, "data", "uploads", "avatars")
+    os.makedirs(avatar_dir, exist_ok=True)
+
+    # 命名文件 (用 user_id 防止重名覆盖)
+    new_filename = f"user_{current_user.id}.{ext}"
+    file_save_path = os.path.join(avatar_dir, new_filename)
+
+    try:
+        # 保存物理文件
+        with open(file_save_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+
+        # 更新数据库中的头像路径
+        # 注意：因为 main.py 中静态目录挂载在 /static 下
+        # app.mount("/static", StaticFiles(directory="data/uploads"))
+        # 所以前端访问路径应该是 /static/avatars/xxx.jpg
+        db_avatar_path = f"/static/avatars/{new_filename}"
+        current_user.avatar = db_avatar_path
+        db.commit()
+
+        return {"status": "success", "avatar_url": db_avatar_path}
+
+    except Exception as e:
+        logger.error(f"头像上传失败: {e}")
+        raise HTTPException(status_code=500, detail="头像保存失败")
 
 @router.get("/sessions")
 def list_sessions(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):

@@ -47,6 +47,9 @@ def login(user_in: UserAuth, db: Session = Depends(get_db)):
     if not user or not security.verify_password(user_in.password, user.hashed_password):
         raise HTTPException(status_code=400, detail="用户名或密码错误")
 
+    if not user.is_active:
+        raise HTTPException(status_code=403, detail="您的账号已被管理员封禁，请联系客服。")
+
     # 2. 生成 Token
     access_token = security.create_access_token(subject=user.id)
     return {"access_token": access_token, "token_type": "bearer"}
@@ -55,6 +58,7 @@ def login(user_in: UserAuth, db: Session = Depends(get_db)):
 def get_captcha(session_id: str):
     """生成一个简单的 4 位验证码并存入 Redis"""
     code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=4))
-    # 存入 Redis，5 分钟过期 (假设你已经有了 redis_client)
+    # 存入 Redis，5 分钟过期
     # redis_client.setex(f"captcha:{session_id}", 300, code.lower())
     return {"captcha_code": code} # 实际项目中应该返回图片流，这里为了方便萌新先返回文本
+

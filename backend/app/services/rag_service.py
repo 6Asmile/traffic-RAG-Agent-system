@@ -51,7 +51,7 @@ class AliyunEmbeddingWrapper(Embeddings):
                 headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
 
                 # ==========================================
-                # ✨ 核心修复：加入 3 次重试机制与网络退避策略
+                # 加入 3 次重试机制与网络退避策略
                 # ==========================================
                 max_retries = 3
                 for attempt in range(max_retries):
@@ -403,6 +403,13 @@ class RAGService:
 
     async def chat_stream(self, query: str, session_id: str = "default"):
         print(f"\n{'=' * 10} [提问] {query} {'=' * 10}")
+
+        #  【埋点 1：记录总请求数】 缓存拦截率
+        if self.redis_client:
+            try:
+                self.redis_client.incr("metrics:total_queries")
+            except:
+                pass
         query = self.strict_clean(query)
         q_vec = self.custom_embeddings.embed_query(query)
 
@@ -410,6 +417,12 @@ class RAGService:
         # cached_ans, cached_src = self.cache.get_semantic_cache(q_vec)
         # if cached_ans:
         #     print("⚡ [缓存命中] 直接返回历史答案")
+        #     #  【埋点 2：记录缓存命中数】 缓存拦截率
+        #     if self.redis_client:
+        #         try:
+        #             self.redis_client.incr("metrics:cache_hits")
+        #         except:
+        #             pass
         #     yield json.dumps({"type": "sources", "data": cached_src})
         #     yield json.dumps({"type": "content", "data": cached_ans})
         #     yield json.dumps({"type": "done", "full_answer": cached_ans})
@@ -427,7 +440,7 @@ class RAGService:
         if self.redis_client:
             raw = self.redis_client.get(history_key)
             if raw:
-                raw_list = json.loads(raw)[-6:] # 取最近6条
+                raw_list = json.loads(raw)[-8:] # 取最近8条
                 history_str_for_rewrite = "\n".join([f"{'用户' if i % 2 == 0 else '助手'}: {msg}" for i, msg in enumerate(raw_list)])
 
                 # 【关键】将历史记录转化为 LangChain Message 对象
@@ -442,7 +455,7 @@ class RAGService:
         history_list =[]
         if self.redis_client:
             raw = self.redis_client.get(history_key)
-            if raw: history_list = json.loads(raw)[-6:]  # 取最近6条
+            if raw: history_list = json.loads(raw)[-8:]  # 取最近8条
 
         search_query = query
         if history_list:
@@ -507,7 +520,7 @@ class RAGService:
                 async for chunk in self.llm.astream(messages_for_agent):
                     content = chunk.content
                     if content:
-                        # 🔥🔥🔥 【核心修复】 过滤阿里模型的 DSML 脏数据 🔥🔥🔥
+
                         # 只要包含这些特征字符，直接跳过不发送给前端
                         if "< | DSML" in content or "function_calls" in content or "| >" in content:
                             continue
@@ -515,6 +528,11 @@ class RAGService:
                         # 简单的清洗，防止多余的换行
                         full_answer += content
                         yield json.dumps({"type": "content", "data": content}, ensure_ascii=False)
+
+                if self.redis_client:
+                    history_list.extend([f"用户: {query}", f"助手: {full_answer}"])
+                    history_key = f"chat_history:{session_id}"
+                    self.redis_client.setex(history_key, 3600, json.dumps(history_list[-16:]))
 
                 yield json.dumps({"type": "done", "full_answer": full_answer})
                 return

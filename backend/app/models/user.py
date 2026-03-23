@@ -11,6 +11,7 @@ class User(Base):
     hashed_password = Column(String(255)) # 存储加密后的密码
     role = Column(String(20), default="user") # user:普通用户, admin:管理员
     avatar = Column(String(500), nullable=True)
+    is_active = Column(Boolean, default=True)
     # --- 新增：存储个人 AI 配置 ---
     ai_preferences = Column(JSON, nullable=True)
     created_at = Column(DateTime, default=datetime.now)
