@@ -231,3 +231,8 @@ xxhash==3.6.0
 yarl==1.22.0
 zipp==3.23.0
 zstandard==0.25.0
+
+jieba~=0.42.1
+docling~=2.78.0
+pip~=24.0
+pillow~=12.1.1

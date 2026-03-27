@@ -4,26 +4,22 @@ import logging
 import os
 import re
 import shutil
-import tempfile
 import time
 from typing import List
 
 import httpx
 import jieba
-from docling.document_converter import DocumentConverter
 # 引入更强的 PDF 解析器
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
-from langchain_core.messages import HumanMessage, ToolMessage, AIMessage, SystemMessage
+from langchain_core.messages import HumanMessage, ToolMessage, AIMessage
 from langchain_openai import ChatOpenAI
-from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
-from pypdf import PdfReader, PdfWriter
 from rank_bm25 import BM25Okapi
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
-from app.core.prompts import RAG_SYSTEM_PROMPT, QUERY_REWRITE_PROMPT,AGENT_SYSTEM_PROMPT
+from app.core.prompts import RAG_SYSTEM_PROMPT, QUERY_REWRITE_PROMPT, AGENT_SYSTEM_PROMPT
 from app.db.session import SessionLocal
 from app.models import User
 from app.models.knowledge import KnowledgeDoc
@@ -472,13 +468,13 @@ class RAGService:
         try:
             print("🤖 [Agent] 正在思考...")
 
-            # 定义 System Prompt，强行压制模型输出 XML 标签
-            agent_system_prompt = SystemMessage(content=AGENT_SYSTEM_PROMPT)
+            # 强行压制模型输出 XML 标签，明确大模型在出行规划中的辅助角色
+            agent_system_prompt = AGENT_SYSTEM_PROMPT
 
             tools = [agent_get_route, agent_search_nearby, agent_get_weather]
             llm_with_tools = self.rewriter_llm.bind_tools(tools)
 
-            messages_for_agent = [agent_system_prompt] + chat_history_objs + [HumanMessage(content=search_query)]
+            messages_for_agent = [agent_system_prompt] + chat_history_objs +[HumanMessage(content=search_query)]
 
             agent_msg = llm_with_tools.invoke(messages_for_agent)
 
@@ -495,47 +491,56 @@ class RAGService:
                     if "route" in tool_name: status_text = "🔄 **正在规划出行方案...**\n\n"
                     elif "nearby" in tool_name: status_text = "🔄 **正在搜索周边设施...**\n\n"
                     elif "weather" in tool_name: status_text = "🔄 **正在查询实时天气...**\n\n"
-
                     yield json.dumps({"type": "content", "data": status_text})
 
                     # 执行工具
                     selected_tool = next(t for t in tools if t.name == tool_name)
                     try:
-                        tool_result = await selected_tool.ainvoke(tool_args)
+                        tool_result_raw = await selected_tool.ainvoke(tool_args)
+                        tool_res_str = str(tool_result_raw)
+
+                        #  UI 组件分离解析
+                        try:
+                            # 尝试把工具的返回值当做 JSON 解析
+                            res_dict = json.loads(tool_res_str)
+                            if "html_widget" in res_dict and "text_data" in res_dict:
+                                # 1. 瞬间将互动 HTML 卡片吐给前端，地图秒开！
+                                yield json.dumps({"type": "content", "data": res_dict["html_widget"] + "\n\n"}, ensure_ascii=False)
+                                # 2. 把纯文本路况数据“悄悄”塞进消息列表，给大模型看
+                                messages_for_agent.append(ToolMessage(content=res_dict["text_data"], tool_call_id=tool_call["id"]))
+                                continue # 这个工具处理完了，跳过下面的 append
+                        except json.JSONDecodeError:
+                            pass # 如果不是 JSON（比如天气），说明是普通文本，直接往下走
+
+                        # 普通工具的纯文本返回结果
+                        messages_for_agent.append(ToolMessage(content=tool_res_str, tool_call_id=tool_call["id"]))
+
                     except Exception as tool_err:
-                        tool_result = f"工具调用失败: {str(tool_err)}"
+                        messages_for_agent.append(ToolMessage(content=f"工具调用失败: {str(tool_err)}", tool_call_id=tool_call["id"]))
 
-                    # 将工具结果加入历史
-                    messages_for_agent.append(ToolMessage(content=str(tool_result), tool_call_id=tool_call["id"]))
-
-                    # 💡 关键优化：如果工具返回了 Markdown 图片，我们已经通过上面的 yield 发给前端渲染了
-                    # 为了防止大模型在总结时又把图片链接复述一遍（导致裂图或重复），我们在喂给大模型前，把 URL 稍微“打码”一下
-                    # 或者依靠 System Prompt 指令（第4条）
-
-                # 6. 生成最终回答 (带清洗过滤器)
+                # 6. 生成最终回答 (带强力清洗过滤器)
                 print("🤖 [Agent] 生成综合建议...")
                 full_answer = ""
 
-                # 重新流式调用 LLM 生成总结
                 async for chunk in self.llm.astream(messages_for_agent):
                     content = chunk.content
                     if content:
+                        #  终极清洗正则：无死角过滤 DSML 和 function_call 脏数据
+                        clean_content = re.sub(r'<\|?DSML\|?.*?>', '', content, flags=re.IGNORECASE)
+                        clean_content = re.sub(r'</\|?DSML\|?.*?>', '', clean_content, flags=re.IGNORECASE)
 
-                        # 只要包含这些特征字符，直接跳过不发送给前端
-                        if "< | DSML" in content or "function_calls" in content or "| >" in content:
-                            continue
+                        if not clean_content.strip(): continue
 
-                        # 简单的清洗，防止多余的换行
-                        full_answer += content
-                        yield json.dumps({"type": "content", "data": content}, ensure_ascii=False)
+                        full_answer += clean_content
+                        yield json.dumps({"type": "content", "data": clean_content}, ensure_ascii=False)
 
+                #  补全 Agent 的历史记录保存，解决“大模型失忆”问题
                 if self.redis_client:
                     history_list.extend([f"用户: {query}", f"助手: {full_answer}"])
-                    history_key = f"chat_history:{session_id}"
                     self.redis_client.setex(history_key, 3600, json.dumps(history_list[-16:]))
 
                 yield json.dumps({"type": "done", "full_answer": full_answer})
-                return
+                return # 工具流程结束，直接返回，绝对不能掉进下面的法规 RAG 里！
             else:
                 print("🧠 [Agent] 未命中工具，转入法规库检索...")
 
