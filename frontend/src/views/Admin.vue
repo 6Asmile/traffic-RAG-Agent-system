@@ -231,7 +231,7 @@
           <div class="td-card">
             <div class="td-card-title">
               交通法规逻辑图谱
-              <el-button type="success" size="small" :icon="Share" :loading="loadingGraph" @click="handleBuildGraph">从对话更新图谱</el-button>
+              <el-button type="success" size="small" :icon="Share" :loading="loadingGraph" @click="handleBuildGraph">从知识库扩展图谱</el-button>
             </div>
             <div ref="graphChartRef" style="height: 450px; background: #fafafa; border: 1px solid #eee; border-radius: 8px;"></div>
           </div>

@@ -1,37 +1,15 @@
 # app/services/tool_service.py
-import re
 
 import httpx
 import logging
 import json
 import urllib.parse
 from app.core.config import settings
+from app.core.constants import AmapAPI, UIConstants  # 引入常量池
 from langchain_core.tools import tool
+import asyncio
 
 logger = logging.getLogger(__name__)
-
-# --- 样式常量：统一管理 UI 风格，适配移动端 ---
-WIDGET_STYLE = (
-    "border: 1px solid #e0e0e0; "
-    "border-radius: 16px; "
-    "overflow: hidden; "
-    "margin: 12px 0; "
-    "background: #ffffff; "
-    "box-shadow: 0 8px 24px rgba(0,0,0,0.12); "
-    "display: flex; "
-    "flex-direction: column;"
-)
-
-HEADER_STYLE = (
-    "padding: 14px 18px; "
-    "background: rgba(255, 255, 255, 0.9); "
-    "backdrop-filter: blur(10px); "
-    "display: flex; "
-    "justify-content: space-between; "
-    "align-items: center; "
-    "border-bottom: 1px solid #f0f0f0; "
-    "z-index: 10;"
-)
 
 
 class ToolService:
@@ -40,18 +18,17 @@ class ToolService:
     async def _resolve_coordinates(client, api_key, address, city=None):
         """智能坐标解析助手 (支持模糊匹配)"""
         try:
-            # 1. 尝试 POI 搜索 (适合模糊地名)
-            poi_url = "https://restapi.amap.com/v3/place/text"
-            res = await client.get(poi_url, params={"key": api_key, "keywords": address, "city": city, "offset": 1,
-                                                    "extensions": "all"})
+            # 1. 尝试 POI 搜索
+            res = await client.get(AmapAPI.PLACE_TEXT,
+                                   params={"key": api_key, "keywords": address, "city": city, "offset": 1,
+                                           "extensions": "all"})
             data = res.json()
             if data.get('status') == '1' and data.get('pois'):
                 top_poi = data['pois'][0]
                 return top_poi['location'], top_poi['name'], top_poi['adcode']
 
-            # 2. 尝试地理编码 (适合精确地址)
-            geo_url = "https://restapi.amap.com/v3/geocode/geo"
-            res = await client.get(geo_url, params={"key": api_key, "address": address})
+            # 2. 尝试地理编码
+            res = await client.get(AmapAPI.GEOCODE, params={"key": api_key, "address": address})
             data = res.json()
             if data.get('status') == '1' and data.get('geocodes'):
                 geo = data['geocodes'][0]
@@ -88,7 +65,8 @@ class ToolService:
                 safe_o_name = urllib.parse.quote(o_name)
                 safe_d_name = urllib.parse.quote(d_name)
 
-                interactive_url = (f"https://uri.amap.com/navigation?"
+                # 使用常量池中的 URI
+                interactive_url = (f"{AmapAPI.URI_NAVIGATION}?"
                                    f"from={o_loc},{safe_o_name}&"
                                    f"to={d_loc},{safe_d_name}&"
                                    f"mode={amap_mode}&"
@@ -98,8 +76,8 @@ class ToolService:
                                    f"callnative=0")
 
                 html_widget = f"""
-<div style="{WIDGET_STYLE}">
-    <div style="{HEADER_STYLE}">
+<div style="{UIConstants.WIDGET_STYLE}">
+    <div style="{UIConstants.HEADER_STYLE}">
         <div style="display: flex; align-items: center; gap: 8px; font-size: 14px; font-weight: bold; color: #1d1d1f;">
             <span style="color: #007aff;">📍</span> {o_name[:8]}... 
             <span style="color: #8e8e93; font-weight: normal; margin: 0 4px;">➔</span> 
@@ -118,17 +96,18 @@ class ToolService:
                 text_data = f"起点：{o_name}，终点：{d_name}。我已经向用户展示了互动地图卡片。\n"
 
                 if mode == "driving":
-                    url = "https://restapi.amap.com/v3/direction/driving"
-                    resp = await client.get(url, params={"key": api_key, "origin": o_loc, "destination": d_loc,
-                                                         "strategy": 10})
+                    resp = await client.get(AmapAPI.DIR_DRIVING,
+                                            params={"key": api_key, "origin": o_loc, "destination": d_loc,
+                                                    "strategy": 10})
                     data = resp.json()
                     if data.get('status') == '1' and data.get('route', {}).get('paths'):
                         r = data['route']['paths'][0]
                         text_data += f"驾车数据：总距离 {round(int(r['distance']) / 1000, 2)}km，耗时约 {round(int(r['duration']) / 60)} 分钟，打车预估 {data['route'].get('taxi_cost', '未知')} 元。"
+
                 elif mode == "transit":
-                    url = "https://restapi.amap.com/v3/direction/transit/integrated"
-                    resp = await client.get(url, params={"key": api_key, "origin": o_loc, "destination": d_loc,
-                                                         "city": o_adcode, "strategy": 0})
+                    resp = await client.get(AmapAPI.DIR_TRANSIT,
+                                            params={"key": api_key, "origin": o_loc, "destination": d_loc,
+                                                    "city": o_adcode, "strategy": 0})
                     data = resp.json()
                     if data.get('status') == '1' and data.get('route', {}).get('transits'):
                         plan = data['route']['transits'][0]
@@ -142,48 +121,42 @@ class ToolService:
 
     @staticmethod
     async def search_nearby(keyword: str, city: str = "全国"):
-        """✨ 智能定位周边搜索雷达 (已修复定位不准问题)"""
+        """✨ 互动版周边搜索雷达"""
         api_key = settings.AMAP_KEY
         if not keyword: return json.dumps({"text_data": "缺少搜索关键词。"}, ensure_ascii=False)
 
         async with httpx.AsyncClient() as client:
             try:
-                # 🌟 核心修复逻辑 1：分析搜索意图
-                # 如果关键词包含类似 "桂电附近的充电桩"，我们需要拆解它
+                import re
                 search_query = str(keyword)
                 anchor_loc = None
                 display_name = search_query
 
-                # 尝试正则提取地标（处理“A附近的B”模式）
                 match = re.search(r"(.+?)(附近|周边)(?:的)?(.+)", search_query)
                 if match:
-                    landmark = match.group(1) # 桂林电子科技大学
-                    poi_type = match.group(3) # 充电桩
-                    # 先解析地标的坐标
+                    landmark = match.group(1)
+                    poi_type = match.group(3)
                     coords, formal_name, _ = await ToolService._resolve_coordinates(client, api_key, landmark, city)
                     if coords:
                         anchor_loc = coords
-                        search_query = poi_type # 搜索词改为纯类型
+                        search_query = poi_type
                         display_name = f"{formal_name} 附近的 {poi_type}"
                 else:
-                    # 如果没匹配到，尝试整体解析一次看是不是直接地标
                     coords, formal_name, _ = await ToolService._resolve_coordinates(client, api_key, search_query, city)
-                    if coords:
-                        anchor_loc = coords
+                    if coords: anchor_loc = coords
 
-                # 🌟 核心修复逻辑 2：构建 URI
                 safe_keyword = urllib.parse.quote(search_query)
                 safe_city = urllib.parse.quote(city) if city else "全国"
-
-                # 如果找到了中心点坐标，强行使用 center 参数定位
                 center_param = f"&center={anchor_loc}" if anchor_loc else ""
-                interactive_url = f"https://uri.amap.com/search?keyword={safe_keyword}&city={safe_city}{center_param}&view=map&src=mypage&callnative=0"
+
+                # 使用常量池中的 URI
+                interactive_url = f"{AmapAPI.URI_SEARCH}?keyword={safe_keyword}&city={safe_city}{center_param}&view=map&src=mypage&callnative=0"
 
                 html_widget = f"""
-<div style="{WIDGET_STYLE}">
-    <div style="{HEADER_STYLE}">
+<div style="{UIConstants.WIDGET_STYLE}">
+    <div style="{UIConstants.HEADER_STYLE}">
         <div style="font-size: 15px; font-weight: bold; color: #1d1d1f; display: flex; align-items: center; gap: 6px;">
-            <span style="font-size: 18px;">🔍</span> {display_name[:15]}...
+            <span style="font-size: 18px;">📍</span> 周边雷达：{display_name[:15]}...
         </div>
         <a href="{interactive_url}" target="_blank" style="font-size: 12px; color: #ffffff; text-decoration: none; padding: 6px 12px; background: #007aff; border-radius: 20px; font-weight: 500; flex-shrink: 0;">全屏探索</a>
     </div>
@@ -201,16 +174,15 @@ class ToolService:
 
     @staticmethod
     async def get_weather(city_name: str):
-        """🌤️ 沉浸式动态天气卡片 (已修复卡顿与缩进乱码问题)"""
-        import asyncio # 引入异步并发库
+        """🌤️ 沉浸式动态天气卡片"""
         api_key = settings.AMAP_KEY
         if not city_name: return json.dumps({"text_data": "缺少城市名称。"}, ensure_ascii=False)
 
         async with httpx.AsyncClient() as client:
             try:
                 city_name = str(city_name)
-                geo_url = "https://restapi.amap.com/v3/geocode/geo"
-                r_o = await client.get(geo_url, params={"key": api_key, "address": city_name})
+                # 使用常量池中的 API
+                r_o = await client.get(AmapAPI.GEOCODE, params={"key": api_key, "address": city_name})
                 if not r_o.json().get('geocodes'):
                     return json.dumps({"text_data": f"抱歉，无法识别城市：{city_name}"}, ensure_ascii=False)
 
@@ -218,13 +190,10 @@ class ToolService:
                 adcode = city_data['adcode']
                 formatted_city = city_data['city'] if city_data['city'] else city_data['province']
 
-                weather_url = "https://restapi.amap.com/v3/weather/weatherInfo"
-
-                # 🚀 核心优化 1：并发请求！
-                # 同时发起“实况”和“预报”请求，不再傻等，速度直接翻倍！
+                # 并发请求使用常量 API
                 r_live, r_cast = await asyncio.gather(
-                    client.get(weather_url, params={"key": api_key, "city": adcode, "extensions": "base"}),
-                    client.get(weather_url, params={"key": api_key, "city": adcode, "extensions": "all"})
+                    client.get(AmapAPI.WEATHER_INFO, params={"key": api_key, "city": adcode, "extensions": "base"}),
+                    client.get(AmapAPI.WEATHER_INFO, params={"key": api_key, "city": adcode, "extensions": "all"})
                 )
 
                 data_live = r_live.json()
@@ -239,7 +208,6 @@ class ToolService:
                     humidity = live['humidity']
                     report_time = live['reporttime'][:10]
 
-                    # 动态匹配天气背景与图标
                     bg_gradient = "linear-gradient(135deg, #4facfe 0%, #00f2fe 100%)"
                     icon = "☀️"
                     if "雨" in weather:
@@ -252,8 +220,6 @@ class ToolService:
                         bg_gradient = "linear-gradient(135deg, #e0eafc 0%, #cfdef3 100%)"
                         icon = "❄️"
 
-                    # 🚀 核心优化 2：彻底清除 HTML 的前置空格/缩进！
-                    # 防止前端 markdown-it 误将带有 4 个空格缩进的 HTML 当做代码块解析。
                     html_widget = f"""<div style="border-radius: 20px; overflow: hidden; margin: 16px 0; background: {bg_gradient}; box-shadow: 0 10px 30px rgba(0,0,0,0.15); color: #fff; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;">
 <div style="padding: 24px; position: relative;">
 <div style="font-size: 22px; font-weight: 600; text-shadow: 0 2px 4px rgba(0,0,0,0.1);">{formatted_city}</div>
@@ -283,7 +249,8 @@ class ToolService:
                         casts = data_cast['forecasts'][0]['casts'][1:4]
                         html_widget += """<div style="padding: 16px 24px; background: rgba(0,0,0,0.15); border-top: 1px solid rgba(255,255,255,0.1);">\n"""
                         for day in casts:
-                            day_icon = "☀️" if "晴" in day['dayweather'] else "🌧️" if "雨" in day['dayweather'] else "☁️"
+                            day_icon = "☀️" if "晴" in day['dayweather'] else "🌧️" if "雨" in day[
+                                'dayweather'] else "☁️"
                             html_widget += f"""<div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; font-size: 15px;">\n<span style="width: 60px; font-weight:500;">周{day['week']}</span>\n<span style="flex: 1; text-align: center;">{day_icon} {day['dayweather']}</span>\n<span style="width: 80px; text-align: right; opacity: 0.9;">{day['nighttemp']}° / {day['daytemp']}°</span>\n</div>\n"""
                         html_widget += "</div>\n"
                     html_widget += "</div>"
@@ -295,6 +262,7 @@ class ToolService:
             except Exception as e:
                 logger.error(f"天气插件故障: {e}")
                 return json.dumps({"text_data": f"天气查询暂时不可用: {str(e)}"}, ensure_ascii=False)
+
 
 # =================================================================
 # 🌟 原生 Agent Tool Calling 接口定义

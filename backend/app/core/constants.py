@@ -1,0 +1,98 @@
+# app/core/constants.py
+
+class AmapAPI:
+    """高德地图 API 接口地址常量"""
+    # 基础路径
+    REST_API_BASE = "https://restapi.amap.com/v3"
+    URI_API_BASE = "https://uri.amap.com"
+
+    # 1. 基础数据查询接口
+    GEOCODE = f"{REST_API_BASE}/geocode/geo"           # 地理编码（地址转坐标）
+    PLACE_TEXT = f"{REST_API_BASE}/place/text"         # POI 文本搜索
+    WEATHER_INFO = f"{REST_API_BASE}/weather/weatherInfo" # 天气查询
+
+    # 2. 路线规划接口
+    DIR_DRIVING = f"{REST_API_BASE}/direction/driving"               # 驾车
+    DIR_TRANSIT = f"{REST_API_BASE}/direction/transit/integrated"    # 公交/地铁
+    DIR_WALKING = f"{REST_API_BASE}/direction/walking"               # 步行
+
+    # 3. 供前端渲染的 H5 交互式地图 URI
+    URI_NAVIGATION = f"{URI_API_BASE}/navigation" # H5 路线导航
+    URI_SEARCH = f"{URI_API_BASE}/search"         # H5 周边搜索
+
+
+class UIConstants:
+    """后端生成的 HTML Widget 样式常量"""
+    WIDGET_STYLE = (
+        "border: 1px solid #e0e0e0; "
+        "border-radius: 16px; "
+        "overflow: hidden; "
+        "margin: 12px 0; "
+        "background: #ffffff; "
+        "box-shadow: 0 8px 24px rgba(0,0,0,0.12); "
+        "display: flex; "
+        "flex-direction: column;"
+    )
+
+    HEADER_STYLE = (
+        "padding: 14px 18px; "
+        "background: rgba(255, 255, 255, 0.9); "
+        "backdrop-filter: blur(10px); "
+        "display: flex; "
+        "justify-content: space-between; "
+        "align-items: center; "
+        "border-bottom: 1px solid #f0f0f0; "
+        "z-index: 10;"
+    )
+
+
+class SystemConfig:
+    """系统文件路径等全局配置常量"""
+    UPLOAD_DIR = "data/uploads"
+    FAISS_INDEX_DIR = "data/faiss_index"
+
+
+class AIModelConstants:
+    """AI 模型与接口相关常量"""
+    DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+    ALIYUN_RERANK_URL = "https://dashscope.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank"
+    ALIYUN_EMBEDDING_PATH = "/compatible-mode/v1/embeddings"
+    COMPATIBLE_MODE_PATH = "/compatible-mode/v1"
+
+    DEFAULT_RERANK_MODEL = "gte-rerank"
+    DEFAULT_SCORE_THRESHOLD = 0.05
+
+    # 文本切片配置
+    CHUNK_SIZE = 1200
+    CHUNK_OVERLAP = 200
+
+
+class RedisKeys:
+    """Redis 缓存键名常量"""
+    CHAT_HISTORY = "chat_history:{session_id}"
+    METRICS_TOTAL_QUERIES = "metrics:total_queries"
+    METRICS_CACHE_HITS = "metrics:cache_hits"
+    HISTORY_EXPIRE_SECONDS = 3600
+    MAX_HISTORY_LENGTH = 8  # 历史记录保留的最大条数
+
+class QuizConstants:
+    """题库生成配置常量"""
+    DEFAULT_GENERATE_COUNT = 10       # 默认生成的题目数量
+    DOC_SAMPLE_LIMIT = 3             # 每次抽取文档的上限，防止上下文过大
+    MIN_CHUNK_LENGTH = 100           # 参与出题的有效切片最小长度
+    MIN_DIFFICULTY = 3               # 题目最小难度星级
+    MAX_DIFFICULTY = 5               # 题目最大难度星级
+    OPTIONS_LETTERS =["A", "B", "C", "D"] # 选项标号
+
+class AnalyticsConstants:
+    """舆情聚类分析常量"""
+    MAX_CLUSTERS = 8                 # KMeans 默认最大聚类簇数
+    MIN_TEXT_LENGTH = 5              # 纳入聚类分析的最小文本长度
+    MIN_SAMPLES = 10                 # 触发聚类分析的最小问题样本数
+    RANDOM_STATE = 42                # 算法随机数种子，保证结果可复现
+    N_INIT = 10                      # K-Means 初始化次数
+
+class GraphConstants:
+    """知识图谱常量"""
+    MIN_TEXT_LENGTH = 20             # 触发图谱提取的最小文本长度
+    EXTRACT_CHUNK_LIMIT = 15  #  每次触发图谱提取时，从知识库随机抽取的切片数量上限

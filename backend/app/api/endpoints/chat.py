@@ -1,8 +1,9 @@
 # app/api/endpoints/chat.py 完整替换
-
+import hashlib
 import json
 import logging
 import os
+import random
 import shutil
 from datetime import datetime
 from typing import Optional
@@ -13,6 +14,7 @@ from sqlalchemy.orm import Session
 from starlette.responses import StreamingResponse
 
 from app.core.config import settings
+from app.core.constants import GraphConstants
 from app.db.session import SessionLocal
 from app.models import ChatSession, ChatMessage, User, HotTopic, AIConfig
 from app.models.knowledge import KnowledgeDoc
@@ -216,6 +218,18 @@ async def upload_knowledge_file(
 ):
     if current_user.role != "admin":
         raise HTTPException(status_code=403, detail="仅管理员可上传知识库")
+        # === 文件 MD5 防重复校验 ===
+    file_content = await file.read()
+    file_hash = hashlib.md5(file_content).hexdigest()
+
+    # 检查数据库是否已有同名或同 Hash 文件
+    exist_doc = db.query(KnowledgeDoc).filter(
+        (KnowledgeDoc.filename == file.filename)  # 这里如果你数据库里加了 file_hash 字段更好，没有的话先判断文件名
+    ).first()
+    if exist_doc:
+        raise HTTPException(status_code=400, detail="该文件已存在于知识库中，请勿重复上传")
+
+    await file.seek(0)  # 读完哈希后，要把指针拨回开头，否则后面存文件是空的！
 
     allowed_exts = ['pdf', 'txt', 'docx', 'md']
     ext = file.filename.split('.')[-1].lower()
@@ -361,16 +375,32 @@ async def build_graph(
     if current_user.role != "admin":
         raise HTTPException(403, "权限不足")
 
-    # 提取最近的 AI 回答
-    msgs = db.query(ChatMessage).filter(ChatMessage.role == "ai").order_by(ChatMessage.created_at.desc()).limit(
-        10).all()
-    texts = [m.content for m in msgs]
+    # ============================================================
+    # 🌟 核心重构：从知识库 (KnowledgeDoc) 的解析缓存中提取样本
+    # ============================================================
+    docs = db.query(KnowledgeDoc).all()
+    all_chunks = []
 
-    if not texts:
-        return {"status": "error", "message": "暂无 AI 回答数据可供提取"}
+    # 收集所有的知识片段
+    for doc in docs:
+        if doc.parsed_content and isinstance(doc.parsed_content, list):
+            all_chunks.extend(doc.parsed_content)
 
+    if not all_chunks:
+        return {"status": "error", "message": "知识库为空，暂无可用数据构建图谱"}
+
+    # 为防止大模型 API 耗时过长或 Token 爆炸，采用增量抽取策略
+    # 使用常量限制每次抽取的样本数 (例如 15 个切片)
+    sample_size = min(len(all_chunks), GraphConstants.EXTRACT_CHUNK_LIMIT)
+    texts = random.sample(all_chunks, sample_size)
+
+    # 丢给后台任务慢慢处理
     background_tasks.add_task(run_graph_build, texts)
-    return {"status": "processing", "message": "图谱更新任务已在后台启动"}
+
+    return {
+        "status": "processing",
+        "message": f"图谱更新任务已在后台启动，本次随机抽取了 {sample_size} 个知识切片进行深度分析"
+    }
 
 
 @router.get("/stats")
