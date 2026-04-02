@@ -6,7 +6,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.staticfiles import StaticFiles
 
-from app.api.endpoints import test, chat, auth, quiz, admin
+from app.api.endpoints import test, chat, auth, quiz, admin, agentic
 from app.core.config import settings
 
 app = FastAPI(title=settings.PROJECT_NAME)
@@ -47,6 +47,7 @@ app.include_router(chat.router, prefix="/api/v1/chat", tags=["智能问答"])
 app.include_router(test.router, prefix="/api/v1/test", tags=["测试"]) # 建议改为 /v1/test
 app.include_router(quiz.router, prefix="/api/v1/quiz", tags=["模拟考试"])
 app.include_router(admin.router, prefix="/api/v1/admin", tags=["后台管理"])
+app.include_router(agentic.router,prefix="/api/v1/agentic",tags=["Agentic专家模式"])
 
 if __name__ == "__main__":
     import uvicorn
