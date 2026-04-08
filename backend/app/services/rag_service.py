@@ -530,3 +530,4 @@ class RAGService:
         except Exception as e:
             print(f"❌ 生成异常: {e}")
             yield json.dumps({"type": "error", "data": str(e)})
+
