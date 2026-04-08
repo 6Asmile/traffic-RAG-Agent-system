@@ -120,6 +120,26 @@
           <!-- 对话消息 -->
           <div v-for="(msg, index) in chatHistory" :key="index" :class="['msg-row', msg.role === 'user' ? 'is-user' : 'is-ai']">
             <div class="msg-bubble">
+              
+              <!-- 🌟 核心优化：DeepSeek 风格的思维折叠区 -->
+              <div v-if="msg.role === 'ai' && msg.thinking && msg.thinking.length > 0" class="thinking-box">
+                <details :open="loading && index === chatHistory.length - 1">
+                  <summary class="think-summary">
+                    <div class="think-header">
+                      <el-icon class="is-loading" v-if="loading && index === chatHistory.length - 1"><Loading /></el-icon>
+                      <el-icon v-else><Check /></el-icon>
+                      <span>{{ loading && index === chatHistory.length - 1 ? '深度思考中...' : '已完成思考' }}</span>
+                    </div>
+                  </summary>
+                  <ul class="thinking-list">
+                    <li v-for="(step, i) in msg.thinking" :key="i">
+                      <span class="step-dot"></span> {{ step }}
+                    </li>
+                  </ul>
+                </details>
+              </div>
+
+              <!-- 正式回答区 -->
               <div class="markdown-body" v-html="renderMarkdown(msg.content)"></div>
               
               <div v-if="msg.role === 'ai'" class="ai-footer">
@@ -157,27 +177,34 @@
                       <span class="src-link"><el-icon><Document /></el-icon> 引用依据</span>
                     </template>
                     <div class="source-scroll-container">
-  <div v-for="(s, i) in msg.sources" :key="i" class="src-item-card">
-    <div class="src-label">依据 {{ i + 1 }}</div>
-    <!-- 使用 v-html 结合 renderMarkdown 方法来渲染含有 markdown 格式的字符串 -->
-    <div class="src-text markdown-body" v-html="renderMarkdown(s)"></div>
-  </div>
-</div>
+                      <div v-for="(s, i) in msg.sources" :key="i" class="src-item-card">
+                        <div class="src-label">依据 {{ i + 1 }}</div>
+                        <div class="src-text markdown-body" v-html="renderMarkdown(s)"></div>
+                      </div>
+                    </div>
                   </el-popover>
                 </div>
               </div>
             </div>
           </div>
           
-          <div v-if="loading" class="msg-row is-ai">
+          <div v-if="loading && (!chatHistory[chatHistory.length - 1].thinking || chatHistory[chatHistory.length - 1].thinking.length === 0)" class="msg-row is-ai">
             <div class="msg-bubble loading-bubble">
               <div class="typing-dots"><span></span><span></span><span></span></div>
             </div>
           </div>
         </div>
 
-        <!-- 4. 输入框 -->
+        <!-- 4. 输入框与模式选择 -->
         <footer class="input-area-container">
+          <!-- 🌟 核心优化：双引擎切换胶囊 -->
+          <div class="mode-selector-wrapper">
+            <el-radio-group v-model="chatMode" size="small" class="custom-mode-radio">
+              <el-radio-button label="fast"><el-icon><Lightning /></el-icon> 极速模式</el-radio-button>
+              <el-radio-button label="expert"><el-icon><Cpu /></el-icon> 专家模式</el-radio-button>
+            </el-radio-group>
+          </div>
+
           <div class="input-pill">
             <el-button 
               :type="isRecording ? 'danger' : 'default'" 
@@ -204,13 +231,13 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted, nextTick, computed, reactive,onUnmounted } from 'vue';
-import { Plus, ChatLineRound, Delete, Refresh, Document, Top, Menu, Microphone, Mic, VideoPlay, Setting, CaretTop, CaretBottom, HomeFilled } from '@element-plus/icons-vue';
+import { ref, onMounted, nextTick, computed, reactive, onUnmounted } from 'vue';
+// 新增引入了 Check, Lightning, Cpu 等图标
+import { Plus, ChatLineRound, Delete, Refresh, Document, Top, Menu, Microphone, Mic, VideoPlay, Setting, CaretTop, CaretBottom, HomeFilled, Loading, Check, Lightning, Cpu } from '@element-plus/icons-vue';
 import { ElMessage, ElMessageBox } from 'element-plus';
 import request from '../api/request';
 import MarkdownIt from 'markdown-it';
-import { API_BASE_URL } from '../api/config';
-import { STATIC_BASE_URL } from '../api/config';
+import { API_BASE_URL, STATIC_BASE_URL } from '../api/config';
 import { Capacitor } from '@capacitor/core';
 import { TextToSpeech } from '@capacitor-community/text-to-speech';
 
@@ -221,6 +248,7 @@ interface Message {
   role: 'user' | 'ai'; 
   content: string; 
   sources?: string[]; 
+  thinking?: string[]; // 🌟 新增思考过程数组
   is_helpful?: boolean | null;
 }
 
@@ -232,14 +260,14 @@ const loading = ref(false);
 const mobileMenuVisible = ref(false);
 const messageBox = ref<HTMLElement | null>(null);
 const currentUser = ref({ username: '', avatar: '' });
+
+// 🌟 新增模式选择器状态（默认专家模式）
+const chatMode = ref('expert');
+
 const md = new MarkdownIt({ html: true, linkify: true });
 
-// --- 计算属性 ---
-// 修改计算属性
 const fullAvatarUrl = computed(() => {
   if (!currentUser.value.avatar) return 'https://api.dicebear.com/7.x/avataaars/svg?seed=Felix';
-  
-  // 核心修改：使用 STATIC_BASE_URL 拼接
   return `${STATIC_BASE_URL}${currentUser.value.avatar}?t=${Date.now()}`;
 });
 const currentSessionTitle = computed(() => sessions.value.find(i => i.id === currentSessionId.value)?.title || '新对话');
@@ -255,107 +283,61 @@ if (SpeechRecognition) {
   recognition.onresult = (event: any) => { inputQuery.value = event.results[0][0].transcript; };
   recognition.onend = () => { isRecording.value = false; };
 }
-// 切换录音状态
+
 const toggleRecognition = async () => {
   if (isRecording.value) {
-    // --- 停止录音 ---
-    if (Capacitor.isNativePlatform()) {
-      await SpeechRecognition.stop();
-    } else if (webRecognition) {
-      webRecognition.stop();
-    }
+    if (Capacitor.isNativePlatform()) await SpeechRecognition.stop();
+    else if (webRecognition) webRecognition.stop();
     isRecording.value = false;
   } else {
-    // --- 开始录音 ---
-    inputQuery.value = ''; // 清空输入框
+    inputQuery.value = ''; 
     isRecording.value = true;
-
     if (Capacitor.isNativePlatform()) {
-      // APP 模式
       try {
         const hasPermission = await SpeechRecognition.checkPermissions();
-        if (hasPermission.speechRecognition !== 'granted') {
-           await SpeechRecognition.requestPermissions();
-        }
-
-        await SpeechRecognition.start({
-          language: "zh-CN",
-          maxResults: 1,
-          prompt: "请说话...",
-          partialResults: true,
-          popup: false, // Android 上不显示系统自带弹窗，体验更好
-        });
-
-        // 监听实时结果
+        if (hasPermission.speechRecognition !== 'granted') await SpeechRecognition.requestPermissions();
+        await SpeechRecognition.start({ language: "zh-CN", maxResults: 1, prompt: "请说话...", partialResults: true, popup: false });
         SpeechRecognition.addListener('partialResults', (data: any) => {
-          if (data.matches && data.matches.length > 0) {
-            inputQuery.value = data.matches[0];
-          }
+          if (data.matches && data.matches.length > 0) inputQuery.value = data.matches[0];
         });
-        
-        // 监听最终结果(部分手机可能不走 partialResults)
-        // 注意：插件不同版本行为不同，通常 partialResults 够用了
       } catch (e) {
         ElMessage.error('启动录音失败: ' + JSON.stringify(e));
         isRecording.value = false;
       }
     } else {
-      // 网页模式
-      if (webRecognition) {
-        webRecognition.start();
-      } else {
-        ElMessage.warning('当前浏览器不支持语音识别');
-        isRecording.value = false;
-      }
+      if (webRecognition) webRecognition.start();
+      else { ElMessage.warning('当前浏览器不支持语音识别'); isRecording.value = false; }
     }
   }
 };
 
-// --- 初始化与业务 ---
 onMounted(async () => {
   try {
     const [userRes, sessRes] = await Promise.all([request.get('/v1/chat/me'), request.get('/v1/chat/sessions')]);
     currentUser.value = userRes.data;
     sessions.value = sessRes.data;
     
-    // 修复 TS 错误：显式判断第一个元素
     const firstSession = sessions.value[0];
-    if (firstSession) {
-       await switchSession(firstSession.id); 
+    if (firstSession) await switchSession(firstSession.id); 
+    else createNewChat();
+
+    if (Capacitor.isNativePlatform()) {
+      try { await SpeechRecognition.requestPermissions(); } catch (e) {}
     } else {
-       createNewChat();
+      const WebSpeech = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+      if (WebSpeech) {
+        webRecognition = new WebSpeech();
+        webRecognition.lang = 'zh-CN';
+        webRecognition.interimResults = true;
+        webRecognition.onresult = (event: any) => { inputQuery.value = event.results[0][0].transcript; };
+        webRecognition.onend = () => { isRecording.value = false; };
+      }
     }
-     // 初始化 APP 端语音识别权限
-  if (Capacitor.isNativePlatform()) {
-    try {
-      // 请求麦克风权限
-      await SpeechRecognition.requestPermissions();
-    } catch (e) {
-      console.error("无法获取麦克风权限", e);
-    }
-  } else {
-    // 初始化网页端识别
-    const WebSpeech = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-    if (WebSpeech) {
-      webRecognition = new WebSpeech();
-      webRecognition.lang = 'zh-CN';
-      webRecognition.interimResults = true;
-      webRecognition.onresult = (event: any) => {
-        inputQuery.value = event.results[0][0].transcript;
-      };
-      webRecognition.onend = () => { isRecording.value = false; };
-    }
-  }
-  } catch (e) { 
-      // 忽略部分错误，防止页面白屏
-  }
+  } catch (e) {}
 });
 
-// 销毁时清理监听
 onUnmounted(() => {
-  if (Capacitor.isNativePlatform()) {
-    SpeechRecognition.removeAllListeners();
-  }
+  if (Capacitor.isNativePlatform()) SpeechRecognition.removeAllListeners();
 });
 
 const fetchSessions = async () => { sessions.value = (await request.get('/v1/chat/sessions')).data; };
@@ -364,15 +346,16 @@ const fetchHistory = async (id: string) => {
   chatHistory.value = res.data.map((m: any) => ({
     id: m.id,
     is_helpful: m.is_helpful,
-    role: m.role as 'user'|'ai', // 断言修复类型
+    role: m.role as 'user'|'ai', 
     content: m.content, 
-    sources: typeof m.sources === 'string' ? JSON.parse(m.sources) : (m.sources || [])
+    sources: typeof m.sources === 'string' ? JSON.parse(m.sources) : (m.sources || []),
+    thinking:[] // 历史记录不显示思考过程
   }));
   await scrollToBottom();
 };
 const switchSession = async (id: string) => { currentSessionId.value = id; await fetchHistory(id); };
 const switchSessionAndClose = async (id: string) => { await switchSession(id); mobileMenuVisible.value = false; };
-const createNewChat = () => { currentSessionId.value = `session_${Math.random().toString(36).substr(2, 9)}`; chatHistory.value = []; };
+const createNewChat = () => { currentSessionId.value = `session_${Math.random().toString(36).substr(2, 9)}`; chatHistory.value =[]; };
 const createNewChatAndClose = () => { createNewChat(); mobileMenuVisible.value = false; };
 
 // --- 核心流式逻辑 ---
@@ -386,18 +369,22 @@ const handleSend = async () => {
   inputQuery.value = '';
   loading.value = true;
 
-  // 使用 reactive 修复流式不更新问题
-  const aiMsg = reactive<Message>({ role: 'ai', content: '', sources: [] });
+  // 初始化带有 thinking 数组的 AI 响应对象
+  const aiMsg = reactive<Message>({ role: 'ai', content: '', sources: [], thinking:[] });
   chatHistory.value.push(aiMsg);
   await scrollToBottom();
 
   try {
-     const streamUrl = `${API_BASE_URL}/v1/chat/ask_stream`;
+    // 🌟 核心优化：动态切换后端接口
+    const endpoint = chatMode.value === 'expert' ? '/v1/agentic/expert_stream' : '/v1/chat/ask_stream';
+    const streamUrl = `${API_BASE_URL}${endpoint}`;
+    
     const response = await fetch(streamUrl, {
       method: 'POST',
       headers: { 
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${localStorage.getItem('access_token')}` },
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${localStorage.getItem('access_token')}` 
+      },
       body: JSON.stringify({ question, session_id: sid })
     });
     
@@ -418,20 +405,43 @@ const handleSend = async () => {
         const jsonStr = line.replace(/^data:\s*/, "");
         try {
             const payload = JSON.parse(jsonStr);
-            if (payload.type === 'sources') aiMsg.sources = payload.data;
-            else if (payload.type === 'content') {
-                aiMsg.content += payload.data;
+            
+            if (payload.type === 'sources') {
+              aiMsg.sources = payload.data;
+            } else if (payload.type === 'content') {
+                const text = payload.data;
+                // 🌟 核心黑科技：剥离提取中间过程（思考状态）
+                // 匹配如: "\n\n> ⚙️ xxxx\n\n" 或 "🔄 **xxxx**\n\n" 这种后端发来的系统通知
+                if (text.match(/[\s\n]*(> [⚙️🔄📚🗺️🛡️]|🔄 \*\*正在)/)) {
+                    let cleanText = text.replace(/[\n>*\#]/g, '').trim();
+                    if (cleanText) {
+                        if (!aiMsg.thinking) aiMsg.thinking =[];
+                        if (!aiMsg.thinking.includes(cleanText)) {
+                            aiMsg.thinking.push(cleanText);
+                            if (messageBox.value) messageBox.value.scrollTop = messageBox.value.scrollHeight;
+                        }
+                    }
+                    continue; // 拦截成功，不再丢给正文 content
+                }
+                
+                // 正文或地图 Widget
+                aiMsg.content += text;
                 if (messageBox.value) messageBox.value.scrollTop = messageBox.value.scrollHeight;
+
             } else if (payload.type === 'done') {
                 if (payload.message_id) aiMsg.id = payload.message_id;
             }
         } catch(e) {}
       }
-      // 强制微任务更新
       await nextTick();
     }
     await fetchSessions();
-  } catch (e) { aiMsg.content += "\n⚠️ 连接中断"; } finally { loading.value = false; await scrollToBottom(); }
+  } catch (e) { 
+    aiMsg.content += "\n⚠️ 连接中断"; 
+  } finally { 
+    loading.value = false; 
+    await scrollToBottom(); 
+  }
 };
 
 const handleFeedback = async (msg: Message, helpful: boolean) => {
@@ -443,34 +453,21 @@ const handleFeedback = async (msg: Message, helpful: boolean) => {
   } catch (e) { ElMessage.error('失败'); }
 };
 
-// --- 1. 兼容性 TTS (语音朗读) ---
 const speak = async (text: string) => {
-  // 清洗 Markdown 符号
   const cleanText = text.replace(/[#*`>]/g, '').replace(/\[依据\d+\]/g, '');
-
   if (Capacitor.isNativePlatform()) {
-    // === APP 模式：使用 Native TTS ===
     try {
-      await TextToSpeech.stop(); // 先停止之前的
-      await TextToSpeech.speak({
-        text: cleanText,
-        lang: 'zh-CN',
-        rate: 1.0,
-        pitch: 1.0,
-        volume: 1.0,
-        category: 'ambient',
-      });
-    } catch (e) {
-      ElMessage.error('语音朗读失败，请检查手机设置');
-    }
+      await TextToSpeech.stop(); 
+      await TextToSpeech.speak({ text: cleanText, lang: 'zh-CN', rate: 1.0, pitch: 1.0, volume: 1.0, category: 'ambient' });
+    } catch (e) { ElMessage.error('语音朗读失败'); }
   } else {
-    // === 网页模式：使用浏览器 API ===
     window.speechSynthesis.cancel();
     const utterance = new SpeechSynthesisUtterance(cleanText);
     utterance.lang = 'zh-CN';
     window.speechSynthesis.speak(utterance);
   }
 };
+
 const formatTime = (t?: string) => t ? new Date(t).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'}) : '';
 const renderMarkdown = (t: string) => md.render(t);
 const scrollToBottom = async () => { await nextTick(); if (messageBox.value) messageBox.value.scrollTop = messageBox.value.scrollHeight; };
@@ -483,8 +480,6 @@ const deleteSession = async (id: string) => {
     if (currentSessionId.value === id) createNewChat();
   } catch (e) {}
 };
-
-// 辅助函数：解决 TS 6133 报错
 </script>
 
 <style scoped lang="scss">
@@ -550,13 +545,45 @@ const deleteSession = async (id: string) => {
   .session-display { .label { font-size: 9px; color: #999; display: block; } .title { font-size: 16px; margin: 0; color: #333; font-weight: bold; } }
 }
 
-.message-wall { flex: 1; padding: 20px 15% 120px; overflow-y: auto; @media (max-width: 768px) { padding: 15px 10px 100px; } }
+.message-wall { flex: 1; padding: 20px 15% 150px; overflow-y: auto; @media (max-width: 768px) { padding: 15px 10px 130px; } }
 
 .msg-row {
   display: flex; margin-bottom: 20px;
   &.is-user { justify-content: flex-end; .msg-bubble { background: #409eff; color: #fff; border-radius: 16px 16px 2px 16px; } }
   &.is-ai { justify-content: flex-start; .msg-bubble { background: #f4f6f8; color: #333; border-radius: 16px 16px 16px 2px; } }
   .msg-bubble { max-width: 88%; padding: 12px 16px; font-size: 14.5px; line-height: 1.6; }
+}
+
+/* 🌟 DeepSeek 风格思考折叠区 */
+.thinking-box {
+  margin-bottom: 12px;
+  details {
+    background: #ffffff; border: 1px solid #e4e7ed; border-radius: 8px; padding: 8px 12px;
+    box-shadow: 0 2px 6px rgba(0,0,0,0.02); transition: all 0.3s ease;
+  }
+  details[open] { background: #fafafa; padding-bottom: 12px; }
+  
+  .think-summary {
+    list-style: none; cursor: pointer; outline: none;
+    &::-webkit-details-marker { display: none; }
+    
+    .think-header {
+      display: flex; align-items: center; gap: 8px; font-size: 13px; font-weight: bold; color: #909399;
+      transition: color 0.3s;
+      .el-icon { font-size: 16px; }
+    }
+    &:hover .think-header { color: #409eff; }
+  }
+
+  .thinking-list {
+    list-style: none; padding: 10px 0 0 0; margin: 0; border-top: 1px dashed #ebeef5; margin-top: 8px;
+    li {
+      font-size: 12.5px; color: #606266; margin-bottom: 6px; display: flex; align-items: flex-start; gap: 8px;
+      .step-dot {
+        margin-top: 6px; width: 4px; height: 4px; border-radius: 50%; background: #c0c4cc; flex-shrink: 0;
+      }
+    }
+  }
 }
 
 .ai-footer {
@@ -566,13 +593,30 @@ const deleteSession = async (id: string) => {
   .src-link { font-size: 11px; color: #409eff; cursor: pointer; display: flex; align-items: center; gap: 3px; &:hover { text-decoration: underline; } }
 }
 
-/* --- 输入框 --- */
+/* --- 输入框区域 --- */
 .input-area-container {
-  position: absolute; bottom: 20px; left: 15%; right: 15%;
+  position: absolute; bottom: 20px; left: 15%; right: 15%; display: flex; flex-direction: column; align-items: center;
   @media (max-width: 768px) { left: 10px; right: 10px; bottom: 10px; }
+  
+  /* 🌟 模式选择器 */
+  .mode-selector-wrapper {
+    margin-bottom: 10px; align-self: flex-start;
+  }
+  /* 调整 Radio 胶囊样式 */
+  :deep(.custom-mode-radio) {
+    .el-radio-button__inner { 
+      border-radius: 20px !important; border: none; background: #fff; box-shadow: 0 2px 8px rgba(0,0,0,0.05);
+      padding: 6px 16px; font-size: 12px; margin-right: 8px; color: #606266;
+      display: flex; align-items: center; gap: 4px;
+    }
+    .el-radio-button.is-active .el-radio-button__inner {
+      background: #409eff; color: #fff; box-shadow: 0 4px 12px rgba(64,158,255,0.3);
+    }
+  }
+
   .input-pill {
-    background: #fff; border-radius: 24px; padding: 6px 12px; display: flex; align-items: center; gap: 8px;
-    box-shadow: 0 4px 20px rgba(0,0,0,0.08); border: 1px solid #eee;
+    width: 100%; background: #fff; border-radius: 24px; padding: 6px 12px; display: flex; align-items: center; gap: 8px;
+    box-shadow: 0 6px 24px rgba(0,0,0,0.08); border: 1px solid #ebeef5;
     :deep(.el-textarea__inner) { border: none; box-shadow: none; padding: 8px; font-size: 14px; background: transparent; }
     .voice-btn { transition: 0.3s; &:hover { background: #f0f0f0; } }
   }
@@ -589,48 +633,19 @@ const deleteSession = async (id: string) => {
 
 /* --- 滚动条修复 --- */
 .source-scroll-container {
-  max-height: 450px; /* 稍微增高一点，因为带有换行的 Markdown 占地更大 */
-  overflow-y: auto !important; 
-  padding-right: 8px;
+  max-height: 450px; overflow-y: auto !important; padding-right: 8px;
   &::-webkit-scrollbar { width: 5px; display: block !important; }
   &::-webkit-scrollbar-thumb { background: #ddd; border-radius: 10px; }
-  
   .src-item-card {
-    background: #f8f9fa; 
-    padding: 15px; 
-    border-radius: 10px; 
-    margin-bottom: 12px; 
-    border: 1px solid #e4e7ed;
-    box-shadow: 0 2px 8px rgba(0,0,0,0.02);
-    
-    .src-label { 
-      color: #409eff; 
-      font-weight: 800; 
-      font-size: 13px; 
-      margin-bottom: 8px; 
-      border-bottom: 1px solid #eee; 
-      padding-bottom: 5px;
-    }
-    
-    /* 强行约束内部 Markdown 样式，使其紧凑美观。使用 :deep 穿透 scoped 限制 */
-    .src-text { 
-      font-size: 12.5px; 
-      color: #555; 
-      line-height: 1.6;
+    background: #f8f9fa; padding: 15px; border-radius: 10px; margin-bottom: 12px; border: 1px solid #e4e7ed; box-shadow: 0 2px 8px rgba(0,0,0,0.02);
+    .src-label { color: #409eff; font-weight: 800; font-size: 13px; margin-bottom: 8px; border-bottom: 1px solid #eee; padding-bottom: 5px; }
+    .src-text { font-size: 12.5px; color: #555; line-height: 1.6;
       :deep(p) { margin-bottom: 6px; }
-      :deep(h1), :deep(h2), :deep(h3), :deep(h4) { 
-        font-size: 13.5px; font-weight: bold; margin: 8px 0 4px; color: #333;
-      }
+      :deep(h1), :deep(h2), :deep(h3), :deep(h4) { font-size: 13.5px; font-weight: bold; margin: 8px 0 4px; color: #333; }
       :deep(ul), :deep(ol) { padding-left: 18px; margin-bottom: 6px; }
       :deep(li) { margin-bottom: 3px; }
-      /* 隐藏图表错位产生的多余换行 */
       :deep(br) { content: ""; display: block; margin-top: 2px; }
-      /* 优化表格显示（如果Docling提取了表格） */
-      :deep(table) {
-        width: 100%; border-collapse: collapse; margin-bottom: 6px;
-        th, td { border: 1px solid #ddd; padding: 4px 8px; text-align: left; }
-        th { background-color: #f0f2f5; }
-      }
+      :deep(table) { width: 100%; border-collapse: collapse; margin-bottom: 6px; th, td { border: 1px solid #ddd; padding: 4px 8px; text-align: left; } th { background-color: #f0f2f5; } }
     }
   }
 }
@@ -640,16 +655,55 @@ const deleteSession = async (id: string) => {
 .typing-dots { span { width: 6px; height: 6px; background: #909399; border-radius: 50%; display: inline-block; margin: 0 2px; animation: blink 1.4s infinite; } span:nth-child(2) { animation-delay: 0.2s; } span:nth-child(3) { animation-delay: 0.4s; } }
 @keyframes pulse { 0% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(103, 194, 58, 0.7); } 70% { transform: scale(1); box-shadow: 0 0 0 6px rgba(103, 194, 58, 0); } 100% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(103, 194, 58, 0); } }
 @keyframes blink { 0% { opacity: 0.2; } 20% { opacity: 1; } 100% { opacity: 0.2; } }
-
-/* 专门针对移动端抽屉的调整 */
 :deep(.el-drawer__body) { padding: 0; }
 </style>
 
 <style lang="scss">
-/* 全局覆盖 Popover 样式 */
-.legal-source-popper {
-  padding: 15px !important;
-  border-radius: 15px !important;
-  box-shadow: 0 10px 30px rgba(0,0,0,0.15) !important;
+.legal-source-popper { padding: 15px !important; border-radius: 15px !important; box-shadow: 0 10px 30px rgba(0,0,0,0.15) !important; }
+.markdown-body {
+  font-size: 14px;
+  line-height: 1.6;
+  color: #333;
+  
+  /* 🌟 核心修复：表格样式美化 */
+  :deep(table) {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 12px 0;
+    font-size: 13px;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.05);
+    border-radius: 8px;
+    overflow: hidden;
+  }
+  
+  :deep(th) {
+    background-color: #f5f7fa;
+    color: #606266;
+    font-weight: 600;
+    padding: 10px 12px;
+    border: 1px solid #ebeef5;
+    text-align: left;
+  }
+  
+  :deep(td) {
+    padding: 8px 12px;
+    border: 1px solid #ebeef5;
+    color: #555;
+  }
+  
+  :deep(tr:nth-child(even)) {
+    background-color: #fafafa;
+  }
+  
+  :deep(tr:hover) {
+    background-color: #f0f7ff;
+  }
+  
+  /* 防止表格被内容撑爆屏幕 */
+  :deep(table) {
+    display: block;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
 }
 </style>

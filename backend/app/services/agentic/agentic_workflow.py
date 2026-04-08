@@ -167,13 +167,32 @@ class AgenticWorkflowManager:
         return NodeNames.GENERATE
 
     def route_from_action(self, state: AgenticState) -> Literal[NodeNames.GRADE_DOCS, NodeNames.GENERATE]:
+        #路由逻辑：根据本次执行的工具集决定下一步
         messages = state.get("messages", [])
-        tool_calls = messages[-2].tool_calls if len(messages) >= 2 else []
+        if not messages:
+            return NodeNames.GENERATE
 
-        # 法律问题走打分车道，地图/生活服务问题直接走生成快车道
+        # 从后往前找最近的一个 AIMessage (它携带了本次所有的 tool_calls)
+        last_ai_message = None
+        for m in reversed(messages):
+            if hasattr(m, "tool_calls") and m.tool_calls:
+                last_ai_message = m
+                break
+
+        if not last_ai_message:
+            return NodeNames.GENERATE
+
+        tool_calls = last_ai_message.tool_calls
+
+        # 只要这一批工具调用中包含“法规检索”，就必须走打分车道审核
         for tc in tool_calls:
+            # 使用常量进行判断，解耦硬编码
             if tc["name"] == AgentToolNames.LAW_SEARCH:
+                print(f"⚖️ [路由决策] 检测到法律检索行为，引导至 {NodeNames.GRADE_DOCS} 节点")
                 return NodeNames.GRADE_DOCS
+
+        # 纯生活服务/导航类请求，走生成快车道
+        print(f"🚀 [路由决策] 纯外部工具调用，引导至 {NodeNames.GENERATE} 节点")
         return NodeNames.GENERATE
 
     def route_from_grade_docs(self, state: AgenticState) -> Literal[NodeNames.REWRITE, NodeNames.GENERATE]:

@@ -3,6 +3,7 @@
 import os
 import json
 import logging
+import re
 from typing import AsyncGenerator
 from sqlalchemy.orm import Session
 from langchain_openai import ChatOpenAI
@@ -10,8 +11,8 @@ from langchain_community.vectorstores import FAISS
 from langchain_core.messages import HumanMessage, AIMessage
 
 from app.core.config import settings
-from app.core.agentic.agent_constants import  UIEventTypes, NodeNames, AgentToolNames
-from app.core.constants import RedisKeys,SystemConfig,AIModelConstants
+from app.core.agentic.agent_constants import UIEventTypes, NodeNames, AgentToolNames
+from app.core.constants import RedisKeys, SystemConfig, AIModelConstants
 from app.services.config_service import ConfigService
 from app.services.cache_service import CacheManager
 from app.services.rag_service import AliyunEmbeddingWrapper, AliyunReranker
@@ -35,8 +36,10 @@ class AgenticRAGService:
         try:
             self.redis_client = redis.Redis(host=settings.REDIS_HOST, port=settings.REDIS_PORT, db=0,
                                             decode_responses=True)
+            print("🟢 [Redis] 缓存服务连接成功")
         except Exception:
             self.redis_client = None
+            print("🔴 [Redis] 缓存服务连接失败")
 
         self.cache = CacheManager(self.redis_client)
 
@@ -60,6 +63,7 @@ class AgenticRAGService:
         if os.path.exists(os.path.join(self.index_path, "index.faiss")):
             self.vector_db = FAISS.load_local(self.index_path, self.custom_embeddings,
                                               allow_dangerous_deserialization=True)
+            print("🟢 [FAISS] 本地向量库挂载成功")
 
         self.bm25_corpus = []
         self.bm25_instance = None
@@ -73,6 +77,7 @@ class AgenticRAGService:
             self.llm, self.json_llm, all_tools,
             self.vector_db, self.bm25_instance, self.bm25_corpus, self.reranker
         )
+        print("🤖[Agentic] 专家模式工作流引擎初始化完毕")
 
     def _init_bm25(self):
         try:
@@ -87,10 +92,14 @@ class AgenticRAGService:
             if self.bm25_corpus:
                 tokenized_corpus = [list(jieba.cut(text)) for text in self.bm25_corpus]
                 self.bm25_instance = BM25Okapi(tokenized_corpus)
+                print(f"🟢 [BM25] 关键词检索引擎就绪，包含 {len(self.bm25_corpus)} 条切片")
         except Exception as e:
             logger.error(f"BM25 初始化失败: {e}")
 
     async def agentic_chat_stream(self, query: str, session_id: str) -> AsyncGenerator[str, None]:
+        print(f"\n{'=' * 20}[专家模式提问] {'=' * 20}")
+        print(f"👤 用户问题: {query}")
+
         # 获取上下文记忆
         history_key = RedisKeys.CHAT_HISTORY.format(session_id=session_id)
         chat_history_objs = []
@@ -98,12 +107,14 @@ class AgenticRAGService:
             raw = self.redis_client.get(history_key)
             if raw:
                 history_list = json.loads(raw)[-RedisKeys.MAX_HISTORY_LENGTH:]
+                print(f"📚 [记忆加载] 已挂载最近 {len(history_list)} 条历史对话")
                 for i, msg in enumerate(history_list):
                     if i % 2 == 0:
                         chat_history_objs.append(HumanMessage(content=msg))
                     else:
                         chat_history_objs.append(AIMessage(content=msg))
 
+        # 构建图的初始状态
         initial_state = {
             "messages": chat_history_objs + [HumanMessage(content=query)],
             "original_query": query,
@@ -116,13 +127,17 @@ class AgenticRAGService:
 
         full_answer = ""
         emitted_steps = set()  # 防止同一事件向前端重复发送
+        sources_emitted = False  # 锁：记录是否已发送了引用依据
+        final_documents = []
+
+        print("🚀 [Agentic] 正在启动 LangGraph 状态机流转...")
 
         # 核心事件解析器
         async for event in self.workflow_manager.graph.astream_events(initial_state, version="v2"):
             kind = event["event"]
             name = event.get("name", "")
 
-            # 1. 状态变更提示
+            # 1. 状态变更提示 (向前端推送中间状态框)
             if kind == "on_chain_start":
                 step_msg = ""
                 if name == NodeNames.GRADE_DOCS:
@@ -136,33 +151,63 @@ class AgenticRAGService:
 
                 if step_msg and step_msg not in emitted_steps:
                     emitted_steps.add(step_msg)
+                    print(f"🚦 [状态流转] {step_msg}")
                     yield json.dumps({"type": "content", "data": f"\n\n> ⚙️ {step_msg}\n\n"}, ensure_ascii=False)
 
-            # 2. 拦截并发送独立提取的高德 H5 交互地图卡片
+                # 🌟 修复点 1：进入最终生成节点前，抓取检索到的文档并推给前端
+                if name == NodeNames.GENERATE:
+                    node_input = event.get("data", {}).get("input", {})
+                    if isinstance(node_input, dict) and "documents" in node_input:
+                        final_documents = node_input["documents"]
+                        if final_documents and not sources_emitted:
+                            print(f"📑 [推送依据] 发现 {len(final_documents)} 条有效法规切片，推送至前端引用面板")
+                            yield json.dumps({"type": "sources", "data": final_documents}, ensure_ascii=False)
+                            sources_emitted = True
+
+            # 2. 工具执行完毕拦截
             elif kind == "on_tool_end":
+                print(f"🛠️[工具完成] 工具 {name} 顺利执行完毕")
                 tool_output = event["data"].get("output", "")
                 if isinstance(tool_output, str):
                     try:
                         res_dict = json.loads(tool_output)
                         if "html_widget" in res_dict:
+                            print("🗺️ [推送UI组件] 发现高级交互式卡片，推送渲染至前端")
                             yield json.dumps({"type": "content", "data": res_dict["html_widget"] + "\n\n"},
                                              ensure_ascii=False)
                     except json.JSONDecodeError:
                         pass
 
-            # 3. 过滤并输出真正的生成内容
+            # 3. 截获大模型生成节点，推送最终答案
             elif kind == "on_chat_model_stream":
                 metadata = event.get("metadata", {})
                 langgraph_node = metadata.get("langgraph_node")
 
-                # 仅当模型处于最终生成阶段（GENERATE）且不含系统内置 tag 时，才透传前端
+                # 仅当模型处于最终生成阶段（GENERATE）才透传前端
                 if langgraph_node == NodeNames.GENERATE:
                     chunk = event["data"]["chunk"]
                     if chunk.content and isinstance(chunk.content, str):
-                        full_answer += chunk.content
-                        yield json.dumps({"type": "content", "data": chunk.content}, ensure_ascii=False)
+                        # 过滤阿里等模型的 DSML 内部思考脏数据
+                        clean_content = re.sub(r'<\|?DSML\|?.*?>', '', chunk.content, flags=re.IGNORECASE)
+                        clean_content = re.sub(r'</\|?DSML\|?.*?>', '', clean_content, flags=re.IGNORECASE)
+
+                        if clean_content:
+                            full_answer += clean_content
+                            yield json.dumps({"type": "content", "data": clean_content}, ensure_ascii=False)
+
+            # 4. 图谱流转结束时，如果前端还没收到 sources，发一个兜底数据
+            elif kind == "on_chain_end" and name == "LangGraph":
+                final_state = event.get("data", {}).get("output", {})
+                if isinstance(final_state, dict) and "documents" in final_state:
+                    final_documents = final_state["documents"]
+
+        # 🌟 修复点 2：兜底处理，确保不管怎样都闭环
+        if not sources_emitted:
+            print("ℹ️ [引用兜底] 推送最终状态中的引用依据给前端")
+            yield json.dumps({"type": "sources", "data": final_documents}, ensure_ascii=False)
 
         # 结束处理，更新记忆
+        print("💾 [持久化] 正在保存上下文记忆，结束本轮对话流")
         if self.redis_client and full_answer.strip():
             history_list = []
             raw = self.redis_client.get(history_key)
@@ -171,4 +216,5 @@ class AgenticRAGService:
             self.redis_client.setex(history_key, RedisKeys.HISTORY_EXPIRE_SECONDS,
                                     json.dumps(history_list[-RedisKeys.MAX_HISTORY_LENGTH * 2:]))
 
+        # 🌟 修复点 3：完美的完成信号，让前端结束 Loading
         yield json.dumps({"type": "done", "full_answer": full_answer}, ensure_ascii=False)
