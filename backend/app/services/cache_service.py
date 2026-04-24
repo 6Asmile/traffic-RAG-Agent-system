@@ -12,19 +12,29 @@ class CacheManager:
         self.CACHE_KEY = "traffic_semantic_cache"
 
     def _cosine_similarity(self, v1, v2):
-        return np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2))
+        denominator = np.linalg.norm(v1) * np.linalg.norm(v2)
+        if denominator == 0:
+            return 0.0
+        return float(np.dot(v1, v2) / denominator)
 
     def get_semantic_cache(self, query_vector: list, threshold=0.96):
         """语义匹配逻辑"""
-        if not self.redis: return None
+        if not self.redis:
+            return None, None
 
         # 获取所有缓存项
         all_cache = self.redis.hgetall(self.CACHE_KEY)
         for _, val in all_cache.items():
-            data = json.loads(val)
+            try:
+                data = json.loads(val)
+                cached_vector = data.get("vector")
+                if not cached_vector:
+                    continue
+            except Exception:
+                continue
             # 计算当前问题向量与历史缓存向量的相似度
-            if self._cosine_similarity(query_vector, data['vector']) > threshold:
-                return data['answer'], data['sources']
+            if self._cosine_similarity(query_vector, cached_vector) > threshold:
+                return data.get("answer"), data.get("sources")
         return None, None
 
     def set_semantic_cache(self, query_vector: list, answer: str, sources: list):

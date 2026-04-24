@@ -204,6 +204,13 @@ def list_sessions(db: Session = Depends(get_db), current_user: User = Depends(ge
 
 @router.get("/history/{session_id}")
 def get_history(session_id: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    session = db.query(ChatSession).filter(
+        ChatSession.id == session_id,
+        ChatSession.user_id == current_user.id
+    ).first()
+    if not session:
+        raise HTTPException(status_code=404, detail="会话不存在")
+
     return db.query(ChatMessage).filter(ChatMessage.session_id == session_id).order_by(
         ChatMessage.created_at.asc()).all()
 
@@ -287,8 +294,15 @@ def delete_knowledge(doc_id: int, db: Session = Depends(get_db)):
 
 @router.delete("/session/{session_id}")
 def delete_session(session_id: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    session = db.query(ChatSession).filter(
+        ChatSession.id == session_id,
+        ChatSession.user_id == current_user.id
+    ).first()
+    if not session:
+        raise HTTPException(status_code=404, detail="会话不存在")
+
     db.query(ChatMessage).filter(ChatMessage.session_id == session_id).delete()
-    db.query(ChatSession).filter(ChatSession.id == session_id, ChatSession.user_id == current_user.id).delete()
+    db.delete(session)
     db.commit()
     return {"status": "success"}
 
@@ -534,9 +548,19 @@ async def warmup_cache(
     topics = db.query(HotTopic).order_by(HotTopic.hit_count.desc()).limit(5).all()
     count = 0
     for t in topics:
-        for q in t.representative_queries:
+        queries = t.representative_queries or []
+        if isinstance(queries, str):
+            try:
+                parsed = json.loads(queries)
+                queries = parsed if isinstance(parsed, list) else [queries]
+            except Exception:
+                queries = [queries]
+
+        for q in queries:
+            if not isinstance(q, str) or not q.strip():
+                continue
             # 执行一次检索并生成过程，触发缓存机制
-            # 这里调用 service.chat_stream 或者手动触发一次流程
-            await service.chat_stream(q)
+            async for _ in service.chat_stream(q.strip(), session_id=f"warmup_topic_{t.id}"):
+                pass
             count += 1
     return {"status": "success", "warmed_up": count}
