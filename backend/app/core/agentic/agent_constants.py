@@ -2,10 +2,13 @@
 
 class AgentLimits:
     """Agent 运行限制常量"""
-    MAX_RETRIES = 3  # 最大重试次数，硬性防止无限死循环
+    MAX_RETRIES = 3  # 兼容旧常量，新代码应使用下方独立计数器
+    MAX_RELEVANCE_RETRIES = 3  # 相关性重试最大次数，由 node_rewrite 递增
+    MAX_HALLUCINATION_RETRIES = 2  # 幻觉重试最大次数，由 node_grade_hallucination 递增
 
 class NodeNames:
     """LangGraph 节点名称常量"""
+    BOOTSTRAP = "bootstrap_node"
     AGENT = "agent_decision_node"
     ACTION = "tool_execution_node"
     GRADE_DOCS = "document_grading_node"

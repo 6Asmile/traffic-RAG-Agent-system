@@ -11,6 +11,7 @@ from langchain_core.messages import HumanMessage, ToolMessage, SystemMessage
 from app.services.agentic.agentic_state import AgenticState
 from app.core.agentic.agent_constants import AgentLimits, NodeNames, GraderThresholds, UIEventTypes, AgentToolNames, RAGToolConfig
 from app.core.agentic.agent_prompts import ExpertPrompts
+from app.services.agentic.state_store import AgentStateStore
 
 logger = logging.getLogger(__name__)
 
@@ -19,11 +20,12 @@ _BATCH_GRADE_SIZE = 5
 
 
 class AgenticWorkflowManager:
-    def __init__(self, llm, json_llm, tools_list, vector_db, bm25_instance, bm25_corpus, reranker):
+    def __init__(self, llm, json_llm, tools_list, vector_db, bm25_instance, bm25_corpus, reranker, state_store: AgentStateStore | None = None):
         self.llm = llm
         self.json_llm = json_llm
         self.tools = {t.name: t for t in tools_list}
         self.llm_with_tools = self.llm.bind_tools(tools_list)
+        self.state_store = state_store
 
         # 注入底层检索组件以供重试节点独立使用
         self.vector_db = vector_db
@@ -32,6 +34,48 @@ class AgenticWorkflowManager:
         self.reranker = reranker
 
         self.graph = self._build_graph()
+
+    @staticmethod
+    def _snapshot_with_updates(state: AgenticState, updates: dict) -> dict:
+        snapshot = dict(state or {})
+        snapshot.update(updates or {})
+        return snapshot
+
+    @staticmethod
+    def _merge_unique_texts(base_items: list[str], extra_items: list[str]) -> list[str]:
+        merged = []
+        seen = set()
+        for text in (base_items or []) + (extra_items or []):
+            normalized = str(text or "").strip()
+            if not normalized:
+                continue
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            merged.append(normalized)
+        return merged
+
+    def _save_node_checkpoint(
+        self,
+        state: AgenticState,
+        node_name: str,
+        phase: str,
+        status: str = "running",
+        error: str = "",
+    ):
+        if not self.state_store:
+            return
+        run_id = str(state.get("run_id", "") or "").strip()
+        if not run_id:
+            return
+        self.state_store.save_checkpoint(
+            run_id=run_id,
+            node_name=node_name,
+            state=dict(state or {}),
+            phase=phase,
+            status=status,
+            error=error,
+        )
 
     def _extract_json_score(self, text: str, default: str = GraderThresholds.SCORE_NO) -> str:
         """剥离 Markdown 干扰，安全提取裁判模型的打分结果。
@@ -157,12 +201,36 @@ class AgenticWorkflowManager:
             return f"【历史摘要】\n{summary}\n\n【近期对话】\n{recent}"
         return summary or recent
 
+    def _recall_memory_contexts(self, state: AgenticState, query: str) -> list[str]:
+        if not self.state_store:
+            return []
+
+        user_id = state.get("user_id", "")
+        recalled = self.state_store.recall_memory_contexts(
+            user_id=user_id,
+            query=query,
+            limit=3,
+        )
+        return [item for item in recalled if str(item or "").strip()]
+
     # ==========================================
     # 节点具体实现 (Nodes)
     # ==========================================
 
+    async def node_bootstrap(self, state: AgenticState):
+        """入口节点：用于正常启动与断点恢复分流。"""
+        self._save_node_checkpoint(state, NodeNames.BOOTSTRAP, phase="start")
+        updates = {}
+        self._save_node_checkpoint(
+            self._snapshot_with_updates(state, updates),
+            NodeNames.BOOTSTRAP,
+            phase="end",
+        )
+        return updates
+
     async def node_agent(self, state: AgenticState):
         """决策中枢：决定工具调用或直接回应"""
+        self._save_node_checkpoint(state, NodeNames.AGENT, phase="start")
         messages = state.get("messages", [])
         history_messages = state.get("history_messages", [])
         memory_summary = state.get("memory_summary", "")
@@ -197,24 +265,43 @@ class AgenticWorkflowManager:
         invoke_msgs = [sys_msg] + list(history_messages) + list(updated_messages)
 
         response = await self.llm_with_tools.ainvoke(invoke_msgs)
-        return {
+        updates = {
             "messages": [response],
             "search_query": resolved_query,
             "intermediate_steps": [UIEventTypes.THINKING],
         }
+        self._save_node_checkpoint(
+            self._snapshot_with_updates(state, updates),
+            NodeNames.AGENT,
+            phase="end",
+        )
+        return updates
 
     async def node_action(self, state: AgenticState):
         """工具执行器"""
+        self._save_node_checkpoint(state, NodeNames.ACTION, phase="start")
         messages = state.get("messages", [])
+        if not messages:
+            updates = {
+                "private_latest_tool_names": [],
+                "intermediate_steps": [UIEventTypes.ROUTING_TOOL],
+            }
+            self._save_node_checkpoint(
+                self._snapshot_with_updates(state, updates),
+                NodeNames.ACTION,
+                phase="end",
+            )
+            return updates
         last_message = messages[-1]
 
         tool_outputs = []
         retrieved_docs = list(state.get("private_documents", []))
         public_sources = []
         private_tool_contexts = []
+        private_memory_contexts = list(state.get("private_memory_contexts", []))
         private_latest_tool_names = []
 
-        for tool_call in last_message.tool_calls:
+        for tool_call in getattr(last_message, "tool_calls", []) or []:
             tool_name = tool_call["name"]
             tool_args = tool_call["args"]
             private_latest_tool_names.append(tool_name)
@@ -249,24 +336,52 @@ class AgenticWorkflowManager:
                     if normalized_result:
                         private_tool_contexts.append(normalized_result)
             except Exception as e:
+                self._save_node_checkpoint(
+                    state,
+                    NodeNames.ACTION,
+                    phase="error",
+                    status="error",
+                    error=str(e),
+                )
                 tool_outputs.append(ToolMessage(content=f"工具执行异常: {e}", tool_call_id=tool_call["id"]))
 
-        return {
+        # 方案2：检索阶段召回长期记忆，并合并进私有检索文档
+        query_for_memory = state.get("search_query") or state.get("original_query", "")
+        recalled_memories = self._recall_memory_contexts(state, query_for_memory)
+        private_memory_contexts = self._merge_unique_texts(private_memory_contexts, recalled_memories)
+        if AgentToolNames.LAW_SEARCH in private_latest_tool_names:
+            retrieved_docs = self._merge_unique_texts(retrieved_docs, recalled_memories)
+
+        updates = {
             "messages": tool_outputs,
             "private_documents": retrieved_docs,
             "public_sources": public_sources,
             "private_tool_contexts": private_tool_contexts,
+            "private_memory_contexts": private_memory_contexts,
             "private_latest_tool_names": private_latest_tool_names,
         }
+        self._save_node_checkpoint(
+            self._snapshot_with_updates(state, updates),
+            NodeNames.ACTION,
+            phase="end",
+        )
+        return updates
 
     async def node_grade_docs(self, state: AgenticState):
         """相关性质检员（逐条打分）"""
+        self._save_node_checkpoint(state, NodeNames.GRADE_DOCS, phase="start")
         question = state.get("search_query") or state.get("original_query")
         documents = state.get("private_documents", [])
         public_sources = state.get("public_sources", [])
 
         if not documents:
-            return {"public_sources": [], "intermediate_steps": [UIEventTypes.GRADING_DOCS]}
+            updates = {"public_sources": [], "intermediate_steps": [UIEventTypes.GRADING_DOCS]}
+            self._save_node_checkpoint(
+                self._snapshot_with_updates(state, updates),
+                NodeNames.GRADE_DOCS,
+                phase="end",
+            )
+            return updates
 
         # 单条文档：使用原有单条打分提示词
         if len(documents) == 1:
@@ -275,8 +390,20 @@ class AgenticWorkflowManager:
             res = await self.json_llm.ainvoke(prompt)
             grade = self._extract_json_score(res.content)
             if grade == GraderThresholds.SCORE_NO:
-                return {"private_documents": [], "public_sources": [], "intermediate_steps": [UIEventTypes.GRADING_DOCS]}
-            return {"intermediate_steps": [UIEventTypes.GRADING_DOCS]}
+                updates = {"private_documents": [], "public_sources": [], "intermediate_steps": [UIEventTypes.GRADING_DOCS]}
+                self._save_node_checkpoint(
+                    self._snapshot_with_updates(state, updates),
+                    NodeNames.GRADE_DOCS,
+                    phase="end",
+                )
+                return updates
+            updates = {"intermediate_steps": [UIEventTypes.GRADING_DOCS]}
+            self._save_node_checkpoint(
+                self._snapshot_with_updates(state, updates),
+                NodeNames.GRADE_DOCS,
+                phase="end",
+            )
+            return updates
 
         # 多条文档：分批逐条打分
         kept_indices = set()
@@ -321,7 +448,13 @@ class AgenticWorkflowManager:
             print(
                 f"[相关性打分] query='{question[:30]}' | total={len(documents)} | kept=0 | pass_rate=0.0%"
             )
-            return {"private_documents": [], "public_sources": [], "intermediate_steps": [UIEventTypes.GRADING_DOCS]}
+            updates = {"private_documents": [], "public_sources": [], "intermediate_steps": [UIEventTypes.GRADING_DOCS]}
+            self._save_node_checkpoint(
+                self._snapshot_with_updates(state, updates),
+                NodeNames.GRADE_DOCS,
+                phase="end",
+            )
+            return updates
 
         pass_rate = len(filtered_docs) / len(documents) * 100 if documents else 0
         print(
@@ -335,10 +468,16 @@ class AgenticWorkflowManager:
         if len(filtered_docs) < len(documents):
             result["private_documents"] = filtered_docs
             result["public_sources"] = filtered_public_sources
+        self._save_node_checkpoint(
+            self._snapshot_with_updates(state, result),
+            NodeNames.GRADE_DOCS,
+            phase="end",
+        )
         return result
 
     async def node_rewrite(self, state: AgenticState):
         """意图反思与重写器"""
+        self._save_node_checkpoint(state, NodeNames.REWRITE, phase="start")
         question = state.get("search_query") or state.get("original_query")
         history_messages = state.get("history_messages", [])
         memory_summary = state.get("memory_summary", "")
@@ -350,14 +489,21 @@ class AgenticWorkflowManager:
         new_query = res.content.strip()
 
         current_retries = state.get("relevance_retries", 0) + 1
-        return {
+        updates = {
             "search_query": new_query,
             "relevance_retries": current_retries,
             "intermediate_steps": [UIEventTypes.REWRITING],
         }
+        self._save_node_checkpoint(
+            self._snapshot_with_updates(state, updates),
+            NodeNames.REWRITE,
+            phase="end",
+        )
+        return updates
 
     async def node_retrieve_retry(self, state: AgenticState):
         """独立重试检索器：脱离 Agent 直接查库，防止大模型陷入工具选择死循环"""
+        self._save_node_checkpoint(state, NodeNames.RETRIEVE_RETRY, phase="start")
         new_query = state.get("search_query")
         law_tool = self.tools.get(AgentToolNames.LAW_SEARCH)
 
@@ -365,38 +511,86 @@ class AgenticWorkflowManager:
             # 直接调用底层检索工具逻辑
             result = await law_tool.ainvoke({"query": new_query})
             extracted_sources = self._extract_law_sources(result)
+            recalled_memories = self._recall_memory_contexts(state, new_query)
             if extracted_sources:
-                return {
-                    "private_documents": [item["content"] for item in extracted_sources],
+                updates = {
+                    "private_documents": self._merge_unique_texts(
+                        [item["content"] for item in extracted_sources],
+                        recalled_memories,
+                    ),
                     "public_sources": extracted_sources,
+                    "private_memory_contexts": recalled_memories,
                     "intermediate_steps": [UIEventTypes.RETRIEVING],
                 }
+                self._save_node_checkpoint(
+                    self._snapshot_with_updates(state, updates),
+                    NodeNames.RETRIEVE_RETRY,
+                    phase="end",
+                )
+                return updates
 
             normalized_result = self._normalize_tool_result(result)
             if normalized_result and normalized_result != RAGToolConfig.FALLBACK_MESSAGE:
-                return {
-                    "private_documents": [normalized_result],
+                updates = {
+                    "private_documents": self._merge_unique_texts(
+                        [normalized_result],
+                        recalled_memories,
+                    ),
                     "public_sources": [],
+                    "private_memory_contexts": recalled_memories,
                     "intermediate_steps": [UIEventTypes.RETRIEVING],
                 }
+                self._save_node_checkpoint(
+                    self._snapshot_with_updates(state, updates),
+                    NodeNames.RETRIEVE_RETRY,
+                    phase="end",
+                )
+                return updates
 
-            return {"private_documents": [], "public_sources": [], "intermediate_steps": [UIEventTypes.RETRIEVING]}
+            updates = {
+                "private_documents": recalled_memories,
+                "public_sources": [],
+                "private_memory_contexts": recalled_memories,
+                "intermediate_steps": [UIEventTypes.RETRIEVING],
+            }
+            self._save_node_checkpoint(
+                self._snapshot_with_updates(state, updates),
+                NodeNames.RETRIEVE_RETRY,
+                phase="end",
+            )
+            return updates
         except Exception as e:
             logger.error(f"重试检索异常: {e}")
-            return {"private_documents": [], "public_sources": [], "intermediate_steps": [UIEventTypes.RETRIEVING]}
+            self._save_node_checkpoint(
+                state,
+                NodeNames.RETRIEVE_RETRY,
+                phase="error",
+                status="error",
+                error=str(e),
+            )
+            updates = {"private_documents": [], "public_sources": [], "intermediate_steps": [UIEventTypes.RETRIEVING]}
+            self._save_node_checkpoint(
+                self._snapshot_with_updates(state, updates),
+                NodeNames.RETRIEVE_RETRY,
+                phase="end",
+            )
+            return updates
 
     async def node_generate(self, state: AgenticState):
         """综合生成器"""
+        self._save_node_checkpoint(state, NodeNames.GENERATE, phase="start")
         original_query = state.get("original_query", "")
         search_query = state.get("search_query", "")
         documents = state.get("private_documents", [])
         law_sources = state.get("public_sources", [])
         tool_contexts = state.get("private_tool_contexts", [])
+        memory_contexts = state.get("private_memory_contexts", [])
         history_messages = state.get("history_messages", [])
         memory_summary = state.get("memory_summary", "")
 
         law_context = self._build_law_context(law_sources, documents)
         tool_context = "\n\n".join(tool_contexts).strip() or "无"
+        memory_context = "\n\n".join(memory_contexts).strip() or "无"
         history_text = self._render_history(history_messages) if history_messages else ""
         history_context = self._compose_history_context(history_text, memory_summary)
 
@@ -406,6 +600,7 @@ class AgenticWorkflowManager:
         prompt = ExpertPrompts.FINAL_GENERATOR.format(
             law_context=law_context,
             tool_context=tool_context,
+            memory_context=memory_context,
             question=question,
             history=history_context,
         )
@@ -414,21 +609,35 @@ class AgenticWorkflowManager:
         print(
             f"[生成] question='{question[:50]}' | "
             f"docs={len(documents)} | law_sources={len(law_sources)} | "
-            f"tool_contexts={len(tool_contexts)} | history_turns={len(history_messages) // 2}"
+            f"tool_contexts={len(tool_contexts)} | memory_contexts={len(memory_contexts)} | "
+            f"history_turns={len(history_messages) // 2}"
         )
 
-        return {"generation": res.content, "intermediate_steps": [UIEventTypes.GENERATING]}
+        updates = {"generation": res.content, "intermediate_steps": [UIEventTypes.GENERATING]}
+        self._save_node_checkpoint(
+            self._snapshot_with_updates(state, updates),
+            NodeNames.GENERATE,
+            phase="end",
+        )
+        return updates
 
     async def node_grade_hallucination(self, state: AgenticState):
         """幻觉质检员"""
+        self._save_node_checkpoint(state, NodeNames.GRADE_HALLUCINATION, phase="start")
         documents = state.get("private_documents", [])
         generation = state.get("generation", "")
 
         if not documents:
-            return {
+            updates = {
                 "hallucination_passed": True,
                 "intermediate_steps": [UIEventTypes.CHECKING_HALLUCINATION],
             }
+            self._save_node_checkpoint(
+                self._snapshot_with_updates(state, updates),
+                NodeNames.GRADE_HALLUCINATION,
+                phase="end",
+            )
+            return updates
 
         prompt = ExpertPrompts.HALLUCINATION_GRADER.format(documents="\n".join(documents), generation=generation)
         res = await self.json_llm.ainvoke(prompt)
@@ -437,23 +646,61 @@ class AgenticWorkflowManager:
         grade = self._extract_json_score(res.content, default=GraderThresholds.SCORE_YES)
         if grade == GraderThresholds.SCORE_NO:
             current_retries = state.get("hallucination_retries", 0) + 1
-            return {
+            updates = {
                 "hallucination_retries": current_retries,
                 "hallucination_passed": False,
                 "intermediate_steps": [UIEventTypes.CHECKING_HALLUCINATION],
             }
+            self._save_node_checkpoint(
+                self._snapshot_with_updates(state, updates),
+                NodeNames.GRADE_HALLUCINATION,
+                phase="end",
+            )
+            return updates
 
-        return {
+        updates = {
             "hallucination_passed": True,
             "intermediate_steps": [UIEventTypes.CHECKING_HALLUCINATION],
         }
+        self._save_node_checkpoint(
+            self._snapshot_with_updates(state, updates),
+            NodeNames.GRADE_HALLUCINATION,
+            phase="end",
+        )
+        return updates
 
     # ==========================================
     # 路由逻辑 (Conditional Routing)
     # ==========================================
 
+    def route_from_bootstrap(self, state: AgenticState) -> Literal[
+        NodeNames.AGENT,
+        NodeNames.ACTION,
+        NodeNames.GRADE_DOCS,
+        NodeNames.REWRITE,
+        NodeNames.RETRIEVE_RETRY,
+        NodeNames.GENERATE,
+        NodeNames.GRADE_HALLUCINATION,
+    ]:
+        resume_from = str(state.get("resume_from_node", "") or "").strip()
+        allowed = {
+            NodeNames.AGENT,
+            NodeNames.ACTION,
+            NodeNames.GRADE_DOCS,
+            NodeNames.REWRITE,
+            NodeNames.RETRIEVE_RETRY,
+            NodeNames.GENERATE,
+            NodeNames.GRADE_HALLUCINATION,
+        }
+        if resume_from in allowed:
+            logger.warning(f"[恢复执行] 从断点节点恢复: {resume_from}")
+            return resume_from  # type: ignore[return-value]
+        return NodeNames.AGENT
+
     def route_from_agent(self, state: AgenticState) -> Literal[NodeNames.ACTION, NodeNames.GENERATE]:
         messages = state.get("messages", [])
+        if not messages:
+            return NodeNames.GENERATE
         last_message = messages[-1]
         if getattr(last_message, "tool_calls", None):
             return NodeNames.ACTION
@@ -504,6 +751,7 @@ class AgenticWorkflowManager:
     def _build_graph(self) -> StateGraph:
         workflow = StateGraph(AgenticState)
 
+        workflow.add_node(NodeNames.BOOTSTRAP, self.node_bootstrap)
         workflow.add_node(NodeNames.AGENT, self.node_agent)
         workflow.add_node(NodeNames.ACTION, self.node_action)
         workflow.add_node(NodeNames.GRADE_DOCS, self.node_grade_docs)
@@ -512,8 +760,9 @@ class AgenticWorkflowManager:
         workflow.add_node(NodeNames.GENERATE, self.node_generate)
         workflow.add_node(NodeNames.GRADE_HALLUCINATION, self.node_grade_hallucination)
 
-        workflow.set_entry_point(NodeNames.AGENT)
+        workflow.set_entry_point(NodeNames.BOOTSTRAP)
 
+        workflow.add_conditional_edges(NodeNames.BOOTSTRAP, self.route_from_bootstrap)
         workflow.add_conditional_edges(NodeNames.AGENT, self.route_from_agent)
         workflow.add_conditional_edges(NodeNames.ACTION, self.route_from_action)
         workflow.add_conditional_edges(NodeNames.GRADE_DOCS, self.route_from_grade_docs)

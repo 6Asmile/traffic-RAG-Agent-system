@@ -25,6 +25,13 @@ class AgenticState(TypedDict):
     # 【只读语义】跨轮滚动摘要，仅作为上下文参考，不在节点内回写
     memory_summary: str
 
+    # 【只读语义】运行态标识：用于 checkpoint 与恢复
+    run_id: str
+    session_id: str
+    user_id: str
+    resume_from_node: str
+    checkpoint_recovered: bool
+
     # 【只读语义】用户原始问题，全生命周期不变
     original_query: str
 
@@ -39,6 +46,9 @@ class AgenticState(TypedDict):
 
     # 【追加语义】私有工具上下文（仅生成器使用）
     private_tool_contexts: Annotated[List[str], operator.add]
+
+    # 【替换语义】私有长期记忆召回（仅内部使用，不透传前端）
+    private_memory_contexts: List[str]
 
     # 【替换语义】私有工具调用记录（仅路由决策使用）
     private_latest_tool_names: List[str]

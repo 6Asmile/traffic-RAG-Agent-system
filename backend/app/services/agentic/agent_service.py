@@ -8,7 +8,7 @@ from typing import AsyncGenerator
 from sqlalchemy.orm import Session
 from langchain_openai import ChatOpenAI
 from langchain_community.vectorstores import FAISS
-from langchain_core.messages import HumanMessage, AIMessage
+from langchain_core.messages import HumanMessage
 
 from app.core.config import settings
 from app.core.agentic.agent_constants import UIEventTypes, NodeNames, AgentToolNames
@@ -30,6 +30,7 @@ from app.services.rag_service import AliyunEmbeddingWrapper, AliyunReranker
 from app.skills.law_skills import create_law_search_tool
 from app.skills.amap_skills import create_amap_tools
 from app.services.agentic.agentic_workflow import AgenticWorkflowManager
+from app.services.agentic.state_store import AgentStateStore
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +54,7 @@ class AgenticRAGService:
             print("🔴 [Redis] 缓存服务连接失败")
 
         self.cache = CacheManager(self.redis_client)
+        self.state_store = AgentStateStore(self.redis_client, db=self.db)
 
         user_prefs = current_user.ai_preferences if (current_user and current_user.ai_preferences) else {}
         final_llm_model = user_prefs.get("llm_model") or llm_cfg.model_name
@@ -86,7 +88,8 @@ class AgenticRAGService:
 
         self.workflow_manager = AgenticWorkflowManager(
             self.llm, self.json_llm, all_tools,
-            self.vector_db, self.bm25_instance, self.bm25_corpus, self.reranker
+            self.vector_db, self.bm25_instance, self.bm25_corpus, self.reranker,
+            state_store=self.state_store,
         )
         print("🤖[Agentic] 专家模式工作流引擎初始化完毕")
 
@@ -150,6 +153,10 @@ class AgenticRAGService:
         print(f"\n{'=' * 20}[专家模式提问] {'=' * 20}")
         print(f"👤 用户问题: {query}")
 
+        run_id = self.state_store.create_run_id(session_id)
+        safe_user_id = str(self.current_user_id) if self.current_user_id not in (None, "") else "anonymous"
+        self.state_store.start_run(run_id=run_id, user_id=safe_user_id, session_id=session_id, query=query)
+
         # 获取上下文记忆
         history_key, summary_key = self._build_memory_keys(session_id)
         history_entries = load_history_entries(self.redis_client, history_key, RedisKeys.MAX_HISTORY_LENGTH)
@@ -165,11 +172,17 @@ class AgenticRAGService:
             "messages": [HumanMessage(content=query)],
             "history_messages": chat_history_objs,
             "memory_summary": history_summary,
+            "run_id": run_id,
+            "session_id": str(session_id or "default"),
+            "user_id": safe_user_id,
+            "resume_from_node": "",
+            "checkpoint_recovered": False,
             "original_query": query,
             "search_query": query,
             "private_documents": [],
             "public_sources": [],
             "private_tool_contexts": [],
+            "private_memory_contexts": [],
             "private_latest_tool_names": [],
             "relevance_retries": 0,
             "hallucination_retries": 0,
@@ -186,9 +199,24 @@ class AgenticRAGService:
 
         print("🚀 [Agentic] 正在启动 LangGraph 状态机流转...")
 
-        try:
-            # 核心事件解析器
-            async for event in self.workflow_manager.graph.astream_events(initial_state, version="v2"):
+        def _build_sources_payload(state_like: dict) -> list[dict]:
+            public_sources = state_like.get("public_sources") or []
+            if public_sources:
+                return public_sources
+
+            private_docs = state_like.get("private_documents", []) or []
+            filtered_docs = [
+                doc for doc in private_docs
+                if not str(doc).strip().startswith("[长期记忆-")
+            ]
+            return [
+                {"type": "law", "title": f"法规依据 {i + 1}", "label": f"检索片段 {i + 1}", "content": doc}
+                for i, doc in enumerate(filtered_docs)
+            ]
+
+        async def _consume_graph(state: dict):
+            nonlocal full_answer, final_sources, last_sources_payload
+            async for event in self.workflow_manager.graph.astream_events(state, version="v2"):
                 kind = event["event"]
                 name = event.get("name", "")
 
@@ -228,10 +256,7 @@ class AgenticRAGService:
                     if name == NodeNames.GENERATE:
                         node_input = event.get("data", {}).get("input", {})
                         if isinstance(node_input, dict):
-                            final_sources = node_input.get("public_sources") or [
-                                {"type": "law", "title": f"法规依据 {i + 1}", "label": f"检索片段 {i + 1}", "content": doc}
-                                for i, doc in enumerate(node_input.get("private_documents", []))
-                            ]
+                            final_sources = _build_sources_payload(node_input)
                             payload = json.dumps(final_sources, ensure_ascii=False, sort_keys=True)
                             if payload != last_sources_payload:
                                 print(f"📑 [推送依据] 发现 {len(final_sources)} 条有效法规切片，推送至前端引用面板")
@@ -273,10 +298,7 @@ class AgenticRAGService:
                 elif kind == "on_chain_end" and name == "LangGraph":
                     final_state = event.get("data", {}).get("output", {})
                     if isinstance(final_state, dict):
-                        final_sources = final_state.get("public_sources") or [
-                            {"type": "law", "title": f"法规依据 {i + 1}", "label": f"检索片段 {i + 1}", "content": doc}
-                            for i, doc in enumerate(final_state.get("private_documents", []))
-                        ]
+                        final_sources = _build_sources_payload(final_state)
 
                 # 5. 图谱节点异常事件
                 elif kind == "on_chain_error":
@@ -287,15 +309,67 @@ class AgenticRAGService:
                         ensure_ascii=False,
                     )
 
+        recovery_attempted = False
+        try:
+            async for payload in _consume_graph(initial_state):
+                yield payload
+            self.state_store.finish_run(
+                run_id,
+                status="finished",
+                recovered=False,
+                answer_length=len(full_answer),
+                sources_count=len(final_sources),
+            )
         except Exception as e:
             logger.error(f"Agentic 流式处理异常: {e}")
-            try:
-                yield json.dumps(
-                    {"type": "content", "data": "\n\n> ⚠️ 系统处理异常，请稍后重试。\n\n"},
-                    ensure_ascii=False,
+            latest_checkpoint = self.state_store.load_latest_checkpoint(run_id)
+            recovered_state = self.state_store.load_state_snapshot(run_id)
+            resume_node = str(latest_checkpoint.get("last_node", "") or "").strip()
+
+            if recovered_state and resume_node and not recovery_attempted:
+                recovery_attempted = True
+                recovered_state.update(
+                    {
+                        "run_id": run_id,
+                        "session_id": str(session_id or "default"),
+                        "user_id": safe_user_id,
+                        "resume_from_node": resume_node,
+                        "checkpoint_recovered": True,
+                    }
                 )
-            except GeneratorExit:
-                pass
+                try:
+                    yield json.dumps(
+                        {"type": "content", "data": f"\n\n> ♻️ 检测到中断，正在从节点 `{resume_node}` 恢复执行...\n\n"},
+                        ensure_ascii=False,
+                    )
+                    async for payload in _consume_graph(recovered_state):
+                        yield payload
+                    self.state_store.finish_run(
+                        run_id,
+                        status="recovered",
+                        recovered=True,
+                        answer_length=len(full_answer),
+                        sources_count=len(final_sources),
+                    )
+                except Exception as recover_err:
+                    logger.error(f"Agentic 断点恢复失败: {recover_err}")
+                    self.state_store.finish_run(run_id, status="failed", error=str(recover_err))
+                    try:
+                        yield json.dumps(
+                            {"type": "content", "data": "\n\n> ⚠️ 自动恢复失败，请稍后重试。\n\n"},
+                            ensure_ascii=False,
+                        )
+                    except GeneratorExit:
+                        pass
+            else:
+                self.state_store.finish_run(run_id, status="failed", error=str(e))
+                try:
+                    yield json.dumps(
+                        {"type": "content", "data": "\n\n> ⚠️ 系统处理异常，请稍后重试。\n\n"},
+                        ensure_ascii=False,
+                    )
+                except GeneratorExit:
+                    pass
 
         finally:
             # 兜底处理，确保不管怎样都闭环
@@ -323,6 +397,14 @@ class AgenticRAGService:
                     history_entries,
                     query,
                     full_answer,
+                )
+            if full_answer.strip():
+                self.state_store.upsert_long_term_memories(
+                    user_id=safe_user_id,
+                    session_id=session_id,
+                    query=query,
+                    answer=full_answer,
+                    run_id=run_id,
                 )
 
             # 完成信号，让前端结束 Loading（确保仅发送一次）

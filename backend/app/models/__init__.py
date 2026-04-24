@@ -6,4 +6,5 @@ from app.models.knowledge import KnowledgeBase,KnowledgeDoc
 from app.models.analysis import HotTopic
 from .graph import GraphNode, GraphEdge
 from  .quiz import UserQuizRecord,Question
+from .agent_run import AgentRun, AgentRunCheckpoint, AgentMemoryRecord
 # 这样以后你再增加新的模型文件（比如 ChatLog），也记得在这里加一行
