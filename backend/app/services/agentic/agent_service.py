@@ -179,11 +179,21 @@ class AgenticRAGService:
             "checkpoint_recovered": False,
             "original_query": query,
             "search_query": query,
+            "handoff_router": {},
+            "handoff_law": {},
+            "handoff_tool": {},
+            "handoff_synth": {},
+            "handoff_judge": {},
             "private_documents": [],
             "public_sources": [],
             "private_tool_contexts": [],
             "private_memory_contexts": [],
             "private_latest_tool_names": [],
+            "router_scratchpad": {},
+            "law_scratchpad": {},
+            "tool_scratchpad": {},
+            "synth_scratchpad": {},
+            "judge_scratchpad": {},
             "relevance_retries": 0,
             "hallucination_retries": 0,
             "generation": "",
@@ -192,9 +202,11 @@ class AgenticRAGService:
         }
 
         full_answer = ""
-        emitted_steps = set()  # 使用复合键 "{step_msg}|r{relevance}|h{hallucination}" 防止重试时 UI 状态不可见
+        emitted_steps = set()
         final_sources = []
+        final_risk = {"passed": True, "risk_level": "low", "issues": [], "actions": []}
         last_sources_payload = None
+        last_risk_payload = None
         done_sent = False
 
         print("🚀 [Agentic] 正在启动 LangGraph 状态机流转...")
@@ -215,7 +227,7 @@ class AgenticRAGService:
             ]
 
         async def _consume_graph(state: dict):
-            nonlocal full_answer, final_sources, last_sources_payload
+            nonlocal full_answer, final_sources, final_risk, last_sources_payload, last_risk_payload
             async for event in self.workflow_manager.graph.astream_events(state, version="v2"):
                 kind = event["event"]
                 name = event.get("name", "")
@@ -223,37 +235,29 @@ class AgenticRAGService:
                 # 1. 状态变更提示 (向前端推送中间状态框)
                 if kind == "on_chain_start":
                     step_msg = ""
-                    if name == NodeNames.GRADE_DOCS:
-                        step_msg = UIEventTypes.GRADING_DOCS
-                    elif name == NodeNames.REWRITE:
-                        step_msg = UIEventTypes.REWRITING
-                    elif name == NodeNames.RETRIEVE_RETRY:
-                        step_msg = UIEventTypes.RETRIEVING
-                    elif name == NodeNames.GRADE_HALLUCINATION:
-                        step_msg = UIEventTypes.CHECKING_HALLUCINATION
+                    if name == NodeNames.ROUTER_AGENT:
+                        step_msg = UIEventTypes.ROUTING
+                    elif name == NodeNames.LAW_AGENT:
+                        step_msg = UIEventTypes.LAW_WORKING
+                    elif name == NodeNames.TOOL_AGENT:
+                        step_msg = UIEventTypes.TOOL_WORKING
+                    elif name == NodeNames.SYNTH_AGENT:
+                        step_msg = UIEventTypes.SYNTHESIZING
+                    elif name == NodeNames.JUDGE_AGENT:
+                        step_msg = UIEventTypes.JUDGING
 
                     if step_msg:
-                        # 从事件 input 中读取当前重试计数，构建复合键
-                        node_input = event.get("data", {}).get("input", {})
-                        if isinstance(node_input, dict):
-                            rel_r = node_input.get("relevance_retries", 0)
-                            hal_r = node_input.get("hallucination_retries", 0)
-                        else:
-                            rel_r, hal_r = 0, 0
-                        composite_key = f"{step_msg}|r{rel_r}|h{hal_r}"
-
+                        composite_key = f"{name}|{step_msg}"
                         if composite_key not in emitted_steps:
                             emitted_steps.add(composite_key)
-                            total_retries = rel_r + hal_r
-                            retry_suffix = f"（重试第{total_retries}次）" if total_retries > 0 else ""
-                            print(f"🚦 [状态流转] {step_msg}{retry_suffix}")
+                            print(f"🚦 [状态流转] {step_msg}")
                             yield json.dumps(
-                                {"type": "content", "data": f"\n\n> ⚙️ {step_msg}{retry_suffix}\n\n"},
+                                {"type": "content", "data": f"\n\n> ⚙️ {step_msg}\n\n"},
                                 ensure_ascii=False,
                             )
 
                     # 进入最终生成节点前，抓取检索到的文档并推给前端
-                    if name == NodeNames.GENERATE:
+                    if name == NodeNames.SYNTH_AGENT:
                         node_input = event.get("data", {}).get("input", {})
                         if isinstance(node_input, dict):
                             final_sources = _build_sources_payload(node_input)
@@ -282,8 +286,8 @@ class AgenticRAGService:
                     metadata = event.get("metadata", {})
                     langgraph_node = metadata.get("langgraph_node")
 
-                    # 仅当模型处于最终生成阶段（GENERATE）才透传前端
-                    if langgraph_node == NodeNames.GENERATE:
+                    # 仅当模型处于综合生成阶段（SYNTH_AGENT）才透传前端
+                    if langgraph_node == NodeNames.SYNTH_AGENT:
                         chunk = event["data"]["chunk"]
                         if chunk.content and isinstance(chunk.content, str):
                             # 过滤阿里等模型的 DSML 内部思考脏数据
@@ -295,10 +299,23 @@ class AgenticRAGService:
                                 yield json.dumps({"type": "content", "data": clean_content}, ensure_ascii=False)
 
                 # 4. 图谱流转结束时，如果前端还没收到 sources，发一个兜底数据
+                elif kind == "on_chain_end" and name == NodeNames.JUDGE_AGENT:
+                    node_output = event.get("data", {}).get("output", {})
+                    if isinstance(node_output, dict):
+                        risk_data = node_output.get("handoff_judge")
+                        if isinstance(risk_data, dict):
+                            final_risk = risk_data
+                            risk_payload = json.dumps(final_risk, ensure_ascii=False, sort_keys=True)
+                            if risk_payload != last_risk_payload:
+                                yield json.dumps({"type": "risk", "data": final_risk}, ensure_ascii=False)
+                                last_risk_payload = risk_payload
                 elif kind == "on_chain_end" and name == "LangGraph":
                     final_state = event.get("data", {}).get("output", {})
                     if isinstance(final_state, dict):
                         final_sources = _build_sources_payload(final_state)
+                        risk_data = final_state.get("handoff_judge")
+                        if isinstance(risk_data, dict):
+                            final_risk = risk_data
 
                 # 5. 图谱节点异常事件
                 elif kind == "on_chain_error":
@@ -378,6 +395,13 @@ class AgenticRAGService:
                 print("ℹ️ [引用兜底] 推送最终状态中的引用依据给前端")
                 try:
                     yield json.dumps({"type": "sources", "data": final_sources}, ensure_ascii=False)
+                except GeneratorExit:
+                    pass
+
+            risk_payload = json.dumps(final_risk, ensure_ascii=False, sort_keys=True)
+            if risk_payload != last_risk_payload:
+                try:
+                    yield json.dumps({"type": "risk", "data": final_risk}, ensure_ascii=False)
                 except GeneratorExit:
                     pass
 

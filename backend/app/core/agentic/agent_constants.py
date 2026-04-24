@@ -9,11 +9,18 @@ class AgentLimits:
 class NodeNames:
     """LangGraph 节点名称常量"""
     BOOTSTRAP = "bootstrap_node"
+    ROUTER_AGENT = "router_agent_node"
+    LAW_AGENT = "law_agent_node"
+    TOOL_AGENT = "tool_agent_node"
+    SYNTH_AGENT = "synth_agent_node"
+    JUDGE_AGENT = "judge_agent_node"
+
+    # legacy nodes (兼容旧 checkpoint)
     AGENT = "agent_decision_node"
     ACTION = "tool_execution_node"
     GRADE_DOCS = "document_grading_node"
     REWRITE = "query_rewriting_node"
-    RETRIEVE_RETRY = "retrieve_retry_node"  # 专用于重试的检索节点
+    RETRIEVE_RETRY = "retrieve_retry_node"
     GENERATE = "generation_node"
     GRADE_HALLUCINATION = "hallucination_grading_node"
 
@@ -24,6 +31,11 @@ class GraderThresholds:
 
 class UIEventTypes:
     """流式输出给前端的事件类型常量"""
+    ROUTING = "正在进行任务路由与Agent分配..."
+    LAW_WORKING = "法规Agent正在检索并整理证据..."
+    TOOL_WORKING = "工具Agent正在调用地图/天气能力..."
+    SYNTHESIZING = "综合Agent正在汇总结构化结果..."
+    JUDGING = "审查Agent正在执行事实一致性校验..."
     THINKING = "正在规划思考路径..."
     ROUTING_TOOL = "正在调用外部生态工具..."
     RETRIEVING = "正在检索交通法规知识库..."

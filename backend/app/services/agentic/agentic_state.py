@@ -38,6 +38,13 @@ class AgenticState(TypedDict):
     # 【替换语义】供 RAG 检索使用的搜索词，由 node_rewrite / node_agent 更新
     search_query: str
 
+    # 【替换语义】结构化 handoff（Agent间仅交换结构化数据）
+    handoff_router: dict
+    handoff_law: dict
+    handoff_tool: dict
+    handoff_synth: dict
+    handoff_judge: dict
+
     # 【替换语义】私有检索文档（仅内部使用，不直接透传前端）
     private_documents: List[str]
 
@@ -52,6 +59,13 @@ class AgenticState(TypedDict):
 
     # 【替换语义】私有工具调用记录（仅路由决策使用）
     private_latest_tool_names: List[str]
+
+    # 【替换语义】每个 Agent 私有 scratchpad
+    router_scratchpad: dict
+    law_scratchpad: dict
+    tool_scratchpad: dict
+    synth_scratchpad: dict
+    judge_scratchpad: dict
 
     # 【替换语义】相关性重试计数器，由 node_rewrite 递增后替换
     relevance_retries: int

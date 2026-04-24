@@ -2,32 +2,73 @@
 
 import asyncio
 import json
-import re
 import logging
+import re
+import time
 from typing import Literal
-from langgraph.graph import StateGraph, END
-from langchain_core.messages import HumanMessage, ToolMessage, SystemMessage
 
-from app.services.agentic.agentic_state import AgenticState
-from app.core.agentic.agent_constants import AgentLimits, NodeNames, GraderThresholds, UIEventTypes, AgentToolNames, RAGToolConfig
+from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
+from langgraph.graph import END, StateGraph
+
+from app.core.agentic.agent_constants import (
+    AgentToolNames,
+    GraderThresholds,
+    NodeNames,
+    RAGToolConfig,
+    UIEventTypes,
+)
 from app.core.agentic.agent_prompts import ExpertPrompts
+from app.services.agentic.agentic_state import AgenticState
 from app.services.agentic.state_store import AgentStateStore
+from app.services.agentic.subgraphs import (
+    JudgeAgentSubgraph,
+    LawAgentSubgraph,
+    RouterAgentSubgraph,
+    SynthAgentSubgraph,
+    ToolAgentSubgraph,
+)
 
 logger = logging.getLogger(__name__)
 
-# 每批文档打分最大数量
-_BATCH_GRADE_SIZE = 5
-
 
 class AgenticWorkflowManager:
-    def __init__(self, llm, json_llm, tools_list, vector_db, bm25_instance, bm25_corpus, reranker, state_store: AgentStateStore | None = None):
+    def __init__(
+        self,
+        llm,
+        json_llm,
+        tools_list,
+        vector_db,
+        bm25_instance,
+        bm25_corpus,
+        reranker,
+        state_store: AgentStateStore | None = None,
+    ):
         self.llm = llm
         self.json_llm = json_llm
-        self.tools = {t.name: t for t in tools_list}
-        self.llm_with_tools = self.llm.bind_tools(tools_list)
         self.state_store = state_store
 
-        # 注入底层检索组件以供重试节点独立使用
+        self.tools = {t.name: t for t in tools_list}
+        self.law_tool = self.tools.get(AgentToolNames.LAW_SEARCH)
+        self.external_tool_names = [
+            AgentToolNames.MAP_ROUTE,
+            AgentToolNames.MAP_NEARBY,
+            AgentToolNames.MAP_WEATHER,
+        ]
+        self.external_tools = [self.tools[name] for name in self.external_tool_names if name in self.tools]
+        self.tool_llm = self.llm.bind_tools(self.external_tools) if self.external_tools else None
+        self.agent_policies = {
+            "router": {"timeout_s": 12, "retries": 1, "breaker_threshold": 3, "cooldown_s": 20},
+            "law": {"timeout_s": 15, "retries": 1, "breaker_threshold": 3, "cooldown_s": 30},
+            "tool": {"timeout_s": 12, "retries": 1, "breaker_threshold": 3, "cooldown_s": 25},
+            "synth": {"timeout_s": 18, "retries": 1, "breaker_threshold": 3, "cooldown_s": 20},
+            "judge": {"timeout_s": 10, "retries": 1, "breaker_threshold": 3, "cooldown_s": 20},
+        }
+        self.agent_breakers = {
+            key: {"failures": 0, "opened_until": 0.0}
+            for key in self.agent_policies
+        }
+
+        # compatibility: 保留底层检索组件引用
         self.vector_db = vector_db
         self.bm25_instance = bm25_instance
         self.bm25_corpus = bm25_corpus
@@ -47,9 +88,7 @@ class AgenticWorkflowManager:
         seen = set()
         for text in (base_items or []) + (extra_items or []):
             normalized = str(text or "").strip()
-            if not normalized:
-                continue
-            if normalized in seen:
+            if not normalized or normalized in seen:
                 continue
             seen.add(normalized)
             merged.append(normalized)
@@ -77,45 +116,134 @@ class AgenticWorkflowManager:
             error=error,
         )
 
-    def _extract_json_score(self, text: str, default: str = GraderThresholds.SCORE_NO) -> str:
-        """剥离 Markdown 干扰，安全提取裁判模型的打分结果。
+    def _is_circuit_open(self, agent_key: str) -> bool:
+        state = self.agent_breakers.get(agent_key, {"opened_until": 0.0})
+        return float(state.get("opened_until", 0.0) or 0.0) > time.time()
 
-        Args:
-            default: JSON 解析失败时的默认返回值。
-                     相关性检测应传 SCORE_NO（不相关→重试，安全）；
-                     幻觉检测应传 SCORE_YES（通过→放行，避免误触发重试）。
-        """
-        match = re.search(r'\{[\s\S]*\}', text)
+    def _record_success(self, agent_key: str):
+        if agent_key not in self.agent_breakers:
+            return
+        self.agent_breakers[agent_key] = {"failures": 0, "opened_until": 0.0}
+
+    def _record_failure(self, agent_key: str):
+        policy = self.agent_policies.get(agent_key, {})
+        threshold = int(policy.get("breaker_threshold", 3))
+        cooldown_s = int(policy.get("cooldown_s", 20))
+        breaker = self.agent_breakers.get(agent_key, {"failures": 0, "opened_until": 0.0})
+        failures = int(breaker.get("failures", 0)) + 1
+        opened_until = float(breaker.get("opened_until", 0.0))
+        if failures >= threshold:
+            opened_until = time.time() + cooldown_s
+            failures = 0
+        self.agent_breakers[agent_key] = {"failures": failures, "opened_until": opened_until}
+
+    async def _run_guarded(self, agent_key: str, op_name: str, coro_factory):
+        policy = self.agent_policies.get(agent_key, {})
+        timeout_s = int(policy.get("timeout_s", 10))
+        retries = int(policy.get("retries", 0))
+        metrics = {
+            "agent": agent_key,
+            "operation": op_name,
+            "timeout_s": timeout_s,
+            "max_retries": retries,
+            "attempts": 0,
+            "success": False,
+            "error": "",
+            "timed_out": False,
+            "circuit_open": False,
+            "duration_ms": 0,
+        }
+
+        if self._is_circuit_open(agent_key):
+            metrics["circuit_open"] = True
+            metrics["error"] = "circuit_open"
+            return None, metrics, "circuit_open"
+
+        last_error = ""
+        for attempt in range(1, retries + 2):
+            started = time.perf_counter()
+            metrics["attempts"] = attempt
+            try:
+                result = await asyncio.wait_for(coro_factory(), timeout=timeout_s)
+                metrics["duration_ms"] = int((time.perf_counter() - started) * 1000)
+                metrics["success"] = True
+                self._record_success(agent_key)
+                return result, metrics, ""
+            except asyncio.TimeoutError:
+                last_error = f"timeout_{timeout_s}s"
+                metrics["timed_out"] = True
+                metrics["duration_ms"] = int((time.perf_counter() - started) * 1000)
+            except Exception as e:
+                last_error = str(e)
+                metrics["duration_ms"] = int((time.perf_counter() - started) * 1000)
+
+        self._record_failure(agent_key)
+        metrics["error"] = last_error
+        return None, metrics, last_error
+
+    def _extract_json_score(self, text: str, default: str = GraderThresholds.SCORE_NO) -> str:
+        match = re.search(r"\{[\s\S]*\}", text)
         if match:
             try:
                 data = json.loads(match.group())
-                return data.get("score", default).lower()
+                return str(data.get("score", default)).lower()
             except json.JSONDecodeError:
                 pass
         return default
 
-    def _extract_batch_scores(self, text: str) -> list[dict]:
-        """解析批量打分结果，返回 [{"index": 0, "score": "yes"}, ...]"""
-        match = re.search(r'\[[\s\S]*\]', text)
-        if match:
-            try:
-                data = json.loads(match.group())
-                if isinstance(data, list):
-                    return data
-            except json.JSONDecodeError:
-                pass
+    @staticmethod
+    def _extract_json_object(text: str, default: dict | None = None) -> dict:
+        default = default or {}
+        if not text:
+            return default
+        match = re.search(r"\{[\s\S]*\}", text)
+        if not match:
+            return default
+        try:
+            payload = json.loads(match.group())
+            return payload if isinstance(payload, dict) else default
+        except json.JSONDecodeError:
+            return default
 
-        # 尝试逐个提取 {index, score} 对象
-        results = []
-        for m in re.finditer(r'\{\s*"index"\s*:\s*(\d+)\s*,\s*"score"\s*:\s*"?(yes|no)"?\s*\}', text, re.IGNORECASE):
-            results.append({"index": int(m.group(1)), "score": m.group(2).lower()})
-        return results
+    def _build_tool_plan(self, planner_output: str) -> list[dict]:
+        payload = self._extract_json_object(planner_output, default={})
+        tasks = payload.get("tasks", [])
+        if not isinstance(tasks, list):
+            return []
+
+        normalized_tasks = []
+        for item in tasks:
+            if not isinstance(item, dict):
+                continue
+            tool_name = str(item.get("tool") or "").strip()
+            args = item.get("args") if isinstance(item.get("args"), dict) else {}
+            if tool_name == AgentToolNames.MAP_ROUTE:
+                origin = str(args.get("origin_name") or "").strip()
+                dest = str(args.get("destination_name") or "").strip()
+                mode = str(args.get("mode") or "driving").strip().lower()
+                if not origin or not dest:
+                    continue
+                if mode not in {"driving", "transit", "walking"}:
+                    mode = "driving"
+                normalized_tasks.append(
+                    {"tool": tool_name, "args": {"origin_name": origin, "destination_name": dest, "mode": mode}}
+                )
+            elif tool_name == AgentToolNames.MAP_NEARBY:
+                keyword = str(args.get("keyword") or "").strip()
+                city = str(args.get("city") or "全国").strip() or "全国"
+                if not keyword:
+                    continue
+                normalized_tasks.append({"tool": tool_name, "args": {"keyword": keyword, "city": city}})
+            elif tool_name == AgentToolNames.MAP_WEATHER:
+                city_name = str(args.get("city_name") or "").strip()
+                if not city_name:
+                    continue
+                normalized_tasks.append({"tool": tool_name, "args": {"city_name": city_name}})
+        return normalized_tasks
 
     def _normalize_tool_result(self, raw_result) -> str:
-        """提取工具返回中的纯文本部分，避免把 HTML/JSON 噪声直接送入生成器。"""
         if raw_result is None:
             return ""
-
         result_text = str(raw_result)
         try:
             payload = json.loads(result_text)
@@ -123,11 +251,9 @@ class AgenticWorkflowManager:
                 return str(payload.get("text_data") or payload.get("content") or "").strip()
         except json.JSONDecodeError:
             pass
-
         return result_text.strip()
 
     def _extract_law_sources(self, raw_result) -> list[dict]:
-        """从法规检索工具结果中提取结构化引用。"""
         if raw_result is None:
             return []
 
@@ -141,10 +267,10 @@ class AgenticWorkflowManager:
             return []
 
         sources = payload.get("sources", [])
-        normalized_sources = []
         if not isinstance(sources, list):
-            return normalized_sources
+            return []
 
+        normalized_sources = []
         for index, item in enumerate(sources):
             if not isinstance(item, dict):
                 continue
@@ -163,28 +289,11 @@ class AgenticWorkflowManager:
             )
         return normalized_sources
 
-    def _build_law_context(self, law_sources: list[dict], documents: list[str]) -> str:
-        """优先使用结构化法规来源构造生成上下文。"""
-        if law_sources:
-            blocks = []
-            for index, item in enumerate(law_sources):
-                header = item.get("title") or item.get("label") or f"法规依据 {index + 1}"
-                content = item.get("content", "")
-                if not content:
-                    continue
-                blocks.append(f"[{header}]\n{content}")
-            if blocks:
-                return "\n\n".join(blocks)
-
-        return "\n\n".join(documents).strip() or "无"
-
     @staticmethod
     def _render_history(history_messages, max_turns: int = 4) -> str:
-        """将 LangChain Message 列表渲染为文本，截断至最近 max_turns 轮。"""
         if not history_messages:
             return ""
-        # 取最近 max_turns * 2 条消息
-        sliced = list(history_messages[-(max_turns * 2):])
+        sliced = list(history_messages[-(max_turns * 2) :])
         lines = []
         for msg in sliced:
             role = "用户" if isinstance(msg, HumanMessage) else "助手"
@@ -201,24 +310,28 @@ class AgenticWorkflowManager:
             return f"【历史摘要】\n{summary}\n\n【近期对话】\n{recent}"
         return summary or recent
 
+    @staticmethod
+    def _build_law_context(law_sources: list[dict], documents: list[str]) -> str:
+        if law_sources:
+            blocks = []
+            for index, item in enumerate(law_sources):
+                header = item.get("title") or item.get("label") or f"法规依据 {index + 1}"
+                content = item.get("content", "")
+                if not content:
+                    continue
+                blocks.append(f"[{header}]\n{content}")
+            if blocks:
+                return "\n\n".join(blocks)
+        return "\n\n".join(documents).strip() or "无"
+
     def _recall_memory_contexts(self, state: AgenticState, query: str) -> list[str]:
         if not self.state_store:
             return []
-
         user_id = state.get("user_id", "")
-        recalled = self.state_store.recall_memory_contexts(
-            user_id=user_id,
-            query=query,
-            limit=3,
-        )
-        return [item for item in recalled if str(item or "").strip()]
-
-    # ==========================================
-    # 节点具体实现 (Nodes)
-    # ==========================================
+        contexts = self.state_store.recall_memory_contexts(user_id=user_id, query=query, limit=3)
+        return [item for item in contexts if str(item or "").strip()]
 
     async def node_bootstrap(self, state: AgenticState):
-        """入口节点：用于正常启动与断点恢复分流。"""
         self._save_node_checkpoint(state, NodeNames.BOOTSTRAP, phase="start")
         updates = {}
         self._save_node_checkpoint(
@@ -228,359 +341,334 @@ class AgenticWorkflowManager:
         )
         return updates
 
-    async def node_agent(self, state: AgenticState):
-        """决策中枢：决定工具调用或直接回应"""
-        self._save_node_checkpoint(state, NodeNames.AGENT, phase="start")
-        messages = state.get("messages", [])
-        history_messages = state.get("history_messages", [])
-        memory_summary = state.get("memory_summary", "")
+    async def node_router_agent(self, state: AgenticState):
+        self._save_node_checkpoint(state, NodeNames.ROUTER_AGENT, phase="start")
         original_query = state.get("original_query", "")
-        history_text = self._render_history(history_messages) if history_messages else ""
-        history_context = self._compose_history_context(history_text, memory_summary)
-
-        # 多轮对话指代消解：当有历史且当前问题可能含指代时，先消解
-        resolved_query = original_query
-        if history_context:
-            try:
-                resolve_prompt = ExpertPrompts.CONTEXTUAL_QUERY_REWRITER.format(
-                    history=history_context, question=original_query
-                )
-                resolve_res = await self.llm.ainvoke(resolve_prompt)
-                resolved = resolve_res.content.strip()
-                if resolved:
-                    resolved_query = resolved
-                    print(f"🔍 [指代消解] '{original_query}' → '{resolved_query}'")
-            except Exception as e:
-                logger.warning(f"指代消解失败，降级使用原始问题: {e}")
-
-        # 用消解后的 query 替换 messages 中的 HumanMessage
-        updated_messages = []
-        for msg in messages:
-            if isinstance(msg, HumanMessage) and msg.content == original_query:
-                updated_messages.append(HumanMessage(content=resolved_query))
-            else:
-                updated_messages.append(msg)
-
-        sys_msg = SystemMessage(content=ExpertPrompts.MAIN_AGENT.format(history=history_context or "无"))
-        invoke_msgs = [sys_msg] + list(history_messages) + list(updated_messages)
-
-        response = await self.llm_with_tools.ainvoke(invoke_msgs)
-        updates = {
-            "messages": [response],
-            "search_query": resolved_query,
-            "intermediate_steps": [UIEventTypes.THINKING],
-        }
-        self._save_node_checkpoint(
-            self._snapshot_with_updates(state, updates),
-            NodeNames.AGENT,
-            phase="end",
-        )
-        return updates
-
-    async def node_action(self, state: AgenticState):
-        """工具执行器"""
-        self._save_node_checkpoint(state, NodeNames.ACTION, phase="start")
-        messages = state.get("messages", [])
-        if not messages:
-            updates = {
-                "private_latest_tool_names": [],
-                "intermediate_steps": [UIEventTypes.ROUTING_TOOL],
-            }
-            self._save_node_checkpoint(
-                self._snapshot_with_updates(state, updates),
-                NodeNames.ACTION,
-                phase="end",
-            )
-            return updates
-        last_message = messages[-1]
-
-        tool_outputs = []
-        retrieved_docs = list(state.get("private_documents", []))
-        public_sources = []
-        private_tool_contexts = []
-        private_memory_contexts = list(state.get("private_memory_contexts", []))
-        private_latest_tool_names = []
-
-        for tool_call in getattr(last_message, "tool_calls", []) or []:
-            tool_name = tool_call["name"]
-            tool_args = tool_call["args"]
-            private_latest_tool_names.append(tool_name)
-
-            tool_instance = self.tools.get(tool_name)
-            if tool_instance is None:
-                tool_outputs.append(
-                    ToolMessage(content=f"工具 {tool_name} 不存在或未注册", tool_call_id=tool_call["id"])
-                )
-                continue
-
-            try:
-                result = await tool_instance.ainvoke(tool_args)
-                tool_msg = ToolMessage(content=str(result), tool_call_id=tool_call["id"])
-                tool_outputs.append(tool_msg)
-
-                # 隔离逻辑：仅当调用法律检索时，才将结果纳入审核上下文
-                if tool_name == AgentToolNames.LAW_SEARCH:
-                    extracted_sources = self._extract_law_sources(result)
-                    if extracted_sources:
-                        public_sources.extend(extracted_sources)
-                        retrieved_docs.extend([item["content"] for item in extracted_sources])
-                    normalized_result = self._normalize_tool_result(result)
-                    if (
-                        normalized_result
-                        and normalized_result != RAGToolConfig.FALLBACK_MESSAGE
-                        and not extracted_sources
-                    ):
-                        retrieved_docs.append(normalized_result)
-                else:
-                    normalized_result = self._normalize_tool_result(result)
-                    if normalized_result:
-                        private_tool_contexts.append(normalized_result)
-            except Exception as e:
-                self._save_node_checkpoint(
-                    state,
-                    NodeNames.ACTION,
-                    phase="error",
-                    status="error",
-                    error=str(e),
-                )
-                tool_outputs.append(ToolMessage(content=f"工具执行异常: {e}", tool_call_id=tool_call["id"]))
-
-        # 方案2：检索阶段召回长期记忆，并合并进私有检索文档
-        query_for_memory = state.get("search_query") or state.get("original_query", "")
-        recalled_memories = self._recall_memory_contexts(state, query_for_memory)
-        private_memory_contexts = self._merge_unique_texts(private_memory_contexts, recalled_memories)
-        if AgentToolNames.LAW_SEARCH in private_latest_tool_names:
-            retrieved_docs = self._merge_unique_texts(retrieved_docs, recalled_memories)
-
-        updates = {
-            "messages": tool_outputs,
-            "private_documents": retrieved_docs,
-            "public_sources": public_sources,
-            "private_tool_contexts": private_tool_contexts,
-            "private_memory_contexts": private_memory_contexts,
-            "private_latest_tool_names": private_latest_tool_names,
-        }
-        self._save_node_checkpoint(
-            self._snapshot_with_updates(state, updates),
-            NodeNames.ACTION,
-            phase="end",
-        )
-        return updates
-
-    async def node_grade_docs(self, state: AgenticState):
-        """相关性质检员（逐条打分）"""
-        self._save_node_checkpoint(state, NodeNames.GRADE_DOCS, phase="start")
-        question = state.get("search_query") or state.get("original_query")
-        documents = state.get("private_documents", [])
-        public_sources = state.get("public_sources", [])
-
-        if not documents:
-            updates = {"public_sources": [], "intermediate_steps": [UIEventTypes.GRADING_DOCS]}
-            self._save_node_checkpoint(
-                self._snapshot_with_updates(state, updates),
-                NodeNames.GRADE_DOCS,
-                phase="end",
-            )
-            return updates
-
-        # 单条文档：使用原有单条打分提示词
-        if len(documents) == 1:
-            doc_text = documents[0]
-            prompt = ExpertPrompts.RELEVANCE_GRADER.format(question=question, document=doc_text)
-            res = await self.json_llm.ainvoke(prompt)
-            grade = self._extract_json_score(res.content)
-            if grade == GraderThresholds.SCORE_NO:
-                updates = {"private_documents": [], "public_sources": [], "intermediate_steps": [UIEventTypes.GRADING_DOCS]}
-                self._save_node_checkpoint(
-                    self._snapshot_with_updates(state, updates),
-                    NodeNames.GRADE_DOCS,
-                    phase="end",
-                )
-                return updates
-            updates = {"intermediate_steps": [UIEventTypes.GRADING_DOCS]}
-            self._save_node_checkpoint(
-                self._snapshot_with_updates(state, updates),
-                NodeNames.GRADE_DOCS,
-                phase="end",
-            )
-            return updates
-
-        # 多条文档：分批逐条打分
-        kept_indices = set()
-        batches = [documents[i:i + _BATCH_GRADE_SIZE] for i in range(0, len(documents), _BATCH_GRADE_SIZE)]
-
-        async def _grade_batch(batch_idx: int, batch: list[str]):
-            """对一批文档进行打分，返回保留的文档索引列表。"""
-            numbered = "\n\n".join(
-                f"文档[{batch_idx + j}]：{doc}" for j, doc in enumerate(batch)
-            )
-            prompt = ExpertPrompts.RELEVANCE_GRADER_BATCH.format(question=question, numbered_documents=numbered)
-            try:
-                res = await self.json_llm.ainvoke(prompt)
-                scores = self._extract_batch_scores(res.content)
-                kept = set()
-                for item in scores:
-                    idx = item.get("index", -1)
-                    score = str(item.get("score", "")).lower()
-                    if score == GraderThresholds.SCORE_YES and batch_idx <= idx < batch_idx + len(batch):
-                        kept.add(idx)
-                # 解析失败时保守策略：未出现在结果中的 index 默认保留
-                if len(scores) < len(batch):
-                    for j in range(len(batch)):
-                        kept.add(batch_idx + j)
-                return kept
-            except Exception as e:
-                logger.warning(f"批量打分异常，保守保留该批次: {e}")
-                return {batch_idx + j for j in range(len(batch))}
-
-        # 并发执行各批次打分
-        batch_tasks = [_grade_batch(i * _BATCH_GRADE_SIZE, batch) for i, batch in enumerate(batches)]
-        batch_results = await asyncio.gather(*batch_tasks)
-        for kept_set in batch_results:
-            kept_indices.update(kept_set)
-
-        # 过滤文档和 law_sources
-        filtered_docs = [doc for idx, doc in enumerate(documents) if idx in kept_indices]
-        kept_contents = set(filtered_docs)
-        filtered_public_sources = [src for src in public_sources if src.get("content", "") in kept_contents]
-
-        if not filtered_docs:
-            print(
-                f"[相关性打分] query='{question[:30]}' | total={len(documents)} | kept=0 | pass_rate=0.0%"
-            )
-            updates = {"private_documents": [], "public_sources": [], "intermediate_steps": [UIEventTypes.GRADING_DOCS]}
-            self._save_node_checkpoint(
-                self._snapshot_with_updates(state, updates),
-                NodeNames.GRADE_DOCS,
-                phase="end",
-            )
-            return updates
-
-        pass_rate = len(filtered_docs) / len(documents) * 100 if documents else 0
-        print(
-            f"[相关性打分] query='{question[:30]}' | total={len(documents)} | "
-            f"kept={len(filtered_docs)} | pass_rate={pass_rate:.1f}% | "
-            f"public_sources={len(filtered_public_sources)}/{len(public_sources)}"
-        )
-
-        result = {"intermediate_steps": [UIEventTypes.GRADING_DOCS]}
-        # 仅在过滤后有变化时才更新
-        if len(filtered_docs) < len(documents):
-            result["private_documents"] = filtered_docs
-            result["public_sources"] = filtered_public_sources
-        self._save_node_checkpoint(
-            self._snapshot_with_updates(state, result),
-            NodeNames.GRADE_DOCS,
-            phase="end",
-        )
-        return result
-
-    async def node_rewrite(self, state: AgenticState):
-        """意图反思与重写器"""
-        self._save_node_checkpoint(state, NodeNames.REWRITE, phase="start")
-        question = state.get("search_query") or state.get("original_query")
         history_messages = state.get("history_messages", [])
         memory_summary = state.get("memory_summary", "")
         history_text = self._render_history(history_messages) if history_messages else ""
         history_context = self._compose_history_context(history_text, memory_summary)
 
-        prompt = ExpertPrompts.QUERY_REWRITER.format(question=question, history=history_context)
-        res = await self.llm.ainvoke(prompt)
-        new_query = res.content.strip()
+        rewritten_query = original_query
+        router_metrics = {}
+        if history_context:
+            result, router_metrics, err = await self._run_guarded(
+                "router",
+                "contextual_rewrite",
+                lambda: self.llm.ainvoke(
+                    ExpertPrompts.CONTEXTUAL_QUERY_REWRITER.format(
+                        history=history_context,
+                        question=original_query,
+                    )
+                ),
+            )
+            if result is not None and not err:
+                resolved = str(result.content or "").strip()
+                if resolved:
+                    rewritten_query = resolved
+            else:
+                logger.warning(f"router_agent 指代消解失败，降级原始问题: {err}")
+        else:
+            router_metrics = {
+                "agent": "router",
+                "operation": "contextual_rewrite",
+                "skipped": True,
+                "reason": "history_empty",
+            }
 
-        current_retries = state.get("relevance_retries", 0) + 1
+        handoff_router = RouterAgentSubgraph.build_handoff(
+            query=original_query,
+            rewritten_query=rewritten_query,
+        )
         updates = {
-            "search_query": new_query,
-            "relevance_retries": current_retries,
-            "intermediate_steps": [UIEventTypes.REWRITING],
+            "search_query": handoff_router["rewritten_query"],
+            "handoff_router": handoff_router,
+            "router_scratchpad": {
+                "history_chars": len(history_context),
+                "task_type": handoff_router["task_type"],
+                "metrics": router_metrics,
+            },
+            "intermediate_steps": [UIEventTypes.ROUTING],
         }
         self._save_node_checkpoint(
             self._snapshot_with_updates(state, updates),
-            NodeNames.REWRITE,
+            NodeNames.ROUTER_AGENT,
             phase="end",
         )
         return updates
 
-    async def node_retrieve_retry(self, state: AgenticState):
-        """独立重试检索器：脱离 Agent 直接查库，防止大模型陷入工具选择死循环"""
-        self._save_node_checkpoint(state, NodeNames.RETRIEVE_RETRY, phase="start")
-        new_query = state.get("search_query")
-        law_tool = self.tools.get(AgentToolNames.LAW_SEARCH)
+    async def node_law_agent(self, state: AgenticState):
+        self._save_node_checkpoint(state, NodeNames.LAW_AGENT, phase="start")
+        handoff_router = state.get("handoff_router", {}) or {}
+        need_law = bool(handoff_router.get("need_law"))
+        query = str(state.get("search_query") or state.get("original_query") or "").strip()
 
-        try:
-            # 直接调用底层检索工具逻辑
-            result = await law_tool.ainvoke({"query": new_query})
-            extracted_sources = self._extract_law_sources(result)
-            recalled_memories = self._recall_memory_contexts(state, new_query)
-            if extracted_sources:
-                updates = {
-                    "private_documents": self._merge_unique_texts(
-                        [item["content"] for item in extracted_sources],
-                        recalled_memories,
-                    ),
-                    "public_sources": extracted_sources,
-                    "private_memory_contexts": recalled_memories,
-                    "intermediate_steps": [UIEventTypes.RETRIEVING],
-                }
-                self._save_node_checkpoint(
-                    self._snapshot_with_updates(state, updates),
-                    NodeNames.RETRIEVE_RETRY,
-                    phase="end",
-                )
-                return updates
-
-            normalized_result = self._normalize_tool_result(result)
-            if normalized_result and normalized_result != RAGToolConfig.FALLBACK_MESSAGE:
-                updates = {
-                    "private_documents": self._merge_unique_texts(
-                        [normalized_result],
-                        recalled_memories,
-                    ),
-                    "public_sources": [],
-                    "private_memory_contexts": recalled_memories,
-                    "intermediate_steps": [UIEventTypes.RETRIEVING],
-                }
-                self._save_node_checkpoint(
-                    self._snapshot_with_updates(state, updates),
-                    NodeNames.RETRIEVE_RETRY,
-                    phase="end",
-                )
-                return updates
-
+        if not need_law or not query:
             updates = {
-                "private_documents": recalled_memories,
-                "public_sources": [],
-                "private_memory_contexts": recalled_memories,
-                "intermediate_steps": [UIEventTypes.RETRIEVING],
+                "handoff_law": LawAgentSubgraph.build_handoff([], [], confidence=0.0),
+                "law_scratchpad": {
+                    "skipped": True,
+                    "reason": "need_law_false",
+                    "metrics": {"agent": "law", "operation": "law_search", "skipped": True},
+                },
+                "intermediate_steps": [UIEventTypes.LAW_WORKING],
             }
             self._save_node_checkpoint(
                 self._snapshot_with_updates(state, updates),
-                NodeNames.RETRIEVE_RETRY,
+                NodeNames.LAW_AGENT,
+                phase="end",
+            )
+            return updates
+
+        if self.law_tool is None:
+            updates = {
+                "handoff_law": LawAgentSubgraph.build_handoff([], [], confidence=0.0),
+                "law_scratchpad": {
+                    "skipped": True,
+                    "reason": "law_tool_missing",
+                    "metrics": {"agent": "law", "operation": "law_search", "skipped": True},
+                },
+                "intermediate_steps": [UIEventTypes.LAW_WORKING],
+            }
+            self._save_node_checkpoint(
+                self._snapshot_with_updates(state, updates),
+                NodeNames.LAW_AGENT,
+                phase="end",
+            )
+            return updates
+
+        law_docs = list(state.get("private_documents", []))
+        law_sources: list[dict] = list(state.get("public_sources", []))
+        memory_contexts = list(state.get("private_memory_contexts", []))
+        try:
+            raw_result, law_metrics, law_err = await self._run_guarded(
+                "law",
+                "law_search",
+                lambda: self.law_tool.ainvoke({"query": query}),
+            )
+            if raw_result is None and law_err:
+                raise RuntimeError(law_err)
+            extracted_sources = self._extract_law_sources(raw_result)
+            if extracted_sources:
+                law_sources = extracted_sources
+                law_docs = [item["content"] for item in extracted_sources]
+            else:
+                normalized_result = self._normalize_tool_result(raw_result)
+                if normalized_result and normalized_result != RAGToolConfig.FALLBACK_MESSAGE:
+                    law_docs = [normalized_result]
+
+            recalled_memories = self._recall_memory_contexts(state, query)
+            memory_contexts = self._merge_unique_texts(memory_contexts, recalled_memories)
+            law_docs = self._merge_unique_texts(law_docs, recalled_memories)
+
+            handoff_law = LawAgentSubgraph.build_handoff(
+                law_docs=law_docs,
+                law_sources=law_sources,
+                confidence=0.7 if law_sources else 0.4 if law_docs else 0.0,
+            )
+            updates = {
+                "private_documents": law_docs,
+                "public_sources": law_sources,
+                "private_memory_contexts": memory_contexts,
+                "handoff_law": handoff_law,
+                "law_scratchpad": {
+                    "query": query,
+                    "law_doc_count": len(law_docs),
+                    "law_source_count": len(law_sources),
+                    "memory_count": len(memory_contexts),
+                    "metrics": law_metrics,
+                },
+                "intermediate_steps": [UIEventTypes.LAW_WORKING],
+            }
+            self._save_node_checkpoint(
+                self._snapshot_with_updates(state, updates),
+                NodeNames.LAW_AGENT,
                 phase="end",
             )
             return updates
         except Exception as e:
-            logger.error(f"重试检索异常: {e}")
             self._save_node_checkpoint(
                 state,
-                NodeNames.RETRIEVE_RETRY,
+                NodeNames.LAW_AGENT,
                 phase="error",
                 status="error",
                 error=str(e),
             )
-            updates = {"private_documents": [], "public_sources": [], "intermediate_steps": [UIEventTypes.RETRIEVING]}
+            updates = {
+                "handoff_law": LawAgentSubgraph.build_handoff([], [], confidence=0.0),
+                "law_scratchpad": {
+                    "error": str(e),
+                    "metrics": {"agent": "law", "operation": "law_search", "success": False, "error": str(e)},
+                },
+                "intermediate_steps": [UIEventTypes.LAW_WORKING],
+            }
             self._save_node_checkpoint(
                 self._snapshot_with_updates(state, updates),
-                NodeNames.RETRIEVE_RETRY,
+                NodeNames.LAW_AGENT,
                 phase="end",
             )
             return updates
 
-    async def node_generate(self, state: AgenticState):
-        """综合生成器"""
-        self._save_node_checkpoint(state, NodeNames.GENERATE, phase="start")
+    async def node_tool_agent(self, state: AgenticState):
+        self._save_node_checkpoint(state, NodeNames.TOOL_AGENT, phase="start")
+        handoff_router = state.get("handoff_router", {}) or {}
+        need_tool = bool(handoff_router.get("need_tool"))
+        query = str(state.get("search_query") or state.get("original_query") or "").strip()
+
+        if not need_tool or not query:
+            updates = {
+                "handoff_tool": ToolAgentSubgraph.build_handoff([], [], widget_count=0),
+                "tool_scratchpad": {
+                    "skipped": True,
+                    "reason": "need_tool_false",
+                    "metrics": {"agent": "tool", "operation": "planning", "skipped": True},
+                },
+                "intermediate_steps": [UIEventTypes.TOOL_WORKING],
+            }
+            self._save_node_checkpoint(
+                self._snapshot_with_updates(state, updates),
+                NodeNames.TOOL_AGENT,
+                phase="end",
+            )
+            return updates
+
+        tool_contexts = list(state.get("private_tool_contexts", []))
+        tool_names: list[str] = []
+        tool_messages = []
+        execution_metrics = []
+        planner_metrics = {}
+        planned_tasks: list[dict] = []
+
+        try:
+            planner_prompt = (
+                "你是 tool_agent 参数规划器。"
+                "请根据用户问题生成可执行工具计划，输出严格JSON。"
+                "只允许以下 tool："
+                f"{AgentToolNames.MAP_ROUTE}, {AgentToolNames.MAP_NEARBY}, {AgentToolNames.MAP_WEATHER}。"
+                "JSON格式："
+                '{"tasks":[{"tool":"expert_get_route","args":{"origin_name":"",'
+                '"destination_name":"","mode":"driving|transit|walking"}},'
+                '{"tool":"expert_search_nearby","args":{"keyword":"","city":"全国"}},'
+                '{"tool":"expert_get_weather","args":{"city_name":""}}],'
+                '"notes":["..."]}'
+                "无合适工具时 tasks 返回空数组。"
+                f"\n用户问题：{query}"
+            )
+            planner_result, planner_metrics, planner_err = await self._run_guarded(
+                "tool",
+                "json_planning",
+                lambda: self.json_llm.ainvoke(planner_prompt),
+            )
+            planner_text = str(getattr(planner_result, "content", "") or "")
+            planned_tasks = self._build_tool_plan(planner_text) if not planner_err else []
+            if not planned_tasks and self.tool_llm:
+                # 规划失败时降级到工具调用模型，保持可用性
+                fallback_resp, fallback_metrics, _ = await self._run_guarded(
+                    "tool",
+                    "fallback_tool_call",
+                    lambda: self.tool_llm.ainvoke(
+                        [
+                            SystemMessage(content="你是tool_agent。仅调用外部工具，不回答法规。"),
+                            HumanMessage(content=query),
+                        ]
+                    ),
+                )
+                execution_metrics.append({"fallback_metrics": fallback_metrics})
+                fallback_calls = list(getattr(fallback_resp, "tool_calls", []) or [])
+                for call in fallback_calls:
+                    planned_tasks.append(
+                        {
+                            "tool": str(call.get("name") or "").strip(),
+                            "args": call.get("args") if isinstance(call.get("args"), dict) else {},
+                        }
+                    )
+                # fallback 任务也需要做字段规范化
+                normalized_fallback = self._build_tool_plan(json.dumps({"tasks": planned_tasks}, ensure_ascii=False))
+                planned_tasks = normalized_fallback
+
+            for idx, task in enumerate(planned_tasks):
+                tool_name = str(task.get("tool") or "").strip()
+                tool_args = task.get("args", {}) if isinstance(task.get("args"), dict) else {}
+                if tool_name not in self.tools or tool_name == AgentToolNames.LAW_SEARCH:
+                    continue
+                tool_names.append(tool_name)
+
+                result, invoke_metrics, invoke_err = await self._run_guarded(
+                    "tool",
+                    f"invoke_{tool_name}",
+                    lambda n=tool_name, a=tool_args: self.tools[n].ainvoke(a),
+                )
+                execution_metrics.append(invoke_metrics)
+                if result is not None and not invoke_err:
+                    normalized = self._normalize_tool_result(result)
+                    if normalized:
+                        tool_contexts.append(normalized)
+                    tool_messages.append(ToolMessage(content=str(result), tool_call_id=f"{tool_name}_{idx}"))
+                else:
+                    tool_messages.append(
+                        ToolMessage(
+                            content=f"工具执行异常: {invoke_err}",
+                            tool_call_id=f"{tool_name}_{idx}",
+                        )
+                    )
+
+            handoff_tool = ToolAgentSubgraph.build_handoff(
+                tool_contexts=tool_contexts,
+                tool_names=tool_names,
+                widget_count=0,
+            )
+            updates = {
+                "messages": tool_messages,
+                "private_tool_contexts": tool_contexts,
+                "private_latest_tool_names": tool_names,
+                "handoff_tool": handoff_tool,
+                "tool_scratchpad": {
+                    "query": query,
+                    "planned_tasks": planned_tasks,
+                    "tool_count": len(tool_names),
+                    "tool_context_count": len(tool_contexts),
+                    "metrics": {
+                        "planning": planner_metrics,
+                        "execution": execution_metrics,
+                    },
+                },
+                "intermediate_steps": [UIEventTypes.TOOL_WORKING],
+            }
+            self._save_node_checkpoint(
+                self._snapshot_with_updates(state, updates),
+                NodeNames.TOOL_AGENT,
+                phase="end",
+            )
+            return updates
+        except Exception as e:
+            self._save_node_checkpoint(
+                state,
+                NodeNames.TOOL_AGENT,
+                phase="error",
+                status="error",
+                error=str(e),
+            )
+            updates = {
+                "handoff_tool": ToolAgentSubgraph.build_handoff([], [], widget_count=0),
+                "tool_scratchpad": {
+                    "error": str(e),
+                    "metrics": {"agent": "tool", "operation": "tool_agent", "success": False, "error": str(e)},
+                },
+                "intermediate_steps": [UIEventTypes.TOOL_WORKING],
+            }
+            self._save_node_checkpoint(
+                self._snapshot_with_updates(state, updates),
+                NodeNames.TOOL_AGENT,
+                phase="end",
+            )
+            return updates
+
+    async def node_synth_agent(self, state: AgenticState):
+        self._save_node_checkpoint(state, NodeNames.SYNTH_AGENT, phase="start")
         original_query = state.get("original_query", "")
         search_query = state.get("search_query", "")
+        question = search_query if search_query and search_query != original_query else original_query
+
         documents = state.get("private_documents", [])
         law_sources = state.get("public_sources", [])
         tool_contexts = state.get("private_tool_contexts", [])
@@ -594,9 +682,6 @@ class AgenticWorkflowManager:
         history_text = self._render_history(history_messages) if history_messages else ""
         history_context = self._compose_history_context(history_text, memory_summary)
 
-        # 追问场景：如果 search_query 经过指代消解，优先使用消解后的完整问题
-        question = search_query if search_query and search_query != original_query else original_query
-
         prompt = ExpertPrompts.FINAL_GENERATOR.format(
             law_context=law_context,
             tool_context=tool_context,
@@ -604,172 +689,169 @@ class AgenticWorkflowManager:
             question=question,
             history=history_context,
         )
-        res = await self.llm.ainvoke(prompt)
-
-        print(
-            f"[生成] question='{question[:50]}' | "
-            f"docs={len(documents)} | law_sources={len(law_sources)} | "
-            f"tool_contexts={len(tool_contexts)} | memory_contexts={len(memory_contexts)} | "
-            f"history_turns={len(history_messages) // 2}"
+        result, synth_metrics, synth_err = await self._run_guarded(
+            "synth",
+            "final_generation",
+            lambda: self.llm.ainvoke(prompt),
         )
+        if result is None and synth_err:
+            answer = "生成阶段超时或失败，请稍后重试。"
+        else:
+            answer = str(result.content or "").strip()
 
-        updates = {"generation": res.content, "intermediate_steps": [UIEventTypes.GENERATING]}
-        self._save_node_checkpoint(
-            self._snapshot_with_updates(state, updates),
-            NodeNames.GENERATE,
-            phase="end",
+        handoff_synth = SynthAgentSubgraph.build_handoff(
+            answer=answer,
+            law_count=len(law_sources),
+            tool_count=len(tool_contexts),
+            memory_count=len(memory_contexts),
         )
-        return updates
-
-    async def node_grade_hallucination(self, state: AgenticState):
-        """幻觉质检员"""
-        self._save_node_checkpoint(state, NodeNames.GRADE_HALLUCINATION, phase="start")
-        documents = state.get("private_documents", [])
-        generation = state.get("generation", "")
-
-        if not documents:
-            updates = {
-                "hallucination_passed": True,
-                "intermediate_steps": [UIEventTypes.CHECKING_HALLUCINATION],
-            }
-            self._save_node_checkpoint(
-                self._snapshot_with_updates(state, updates),
-                NodeNames.GRADE_HALLUCINATION,
-                phase="end",
-            )
-            return updates
-
-        prompt = ExpertPrompts.HALLUCINATION_GRADER.format(documents="\n".join(documents), generation=generation)
-        res = await self.json_llm.ainvoke(prompt)
-
-        # 幻觉检测：解析失败时默认 YES（放行），避免误触发重试
-        grade = self._extract_json_score(res.content, default=GraderThresholds.SCORE_YES)
-        if grade == GraderThresholds.SCORE_NO:
-            current_retries = state.get("hallucination_retries", 0) + 1
-            updates = {
-                "hallucination_retries": current_retries,
-                "hallucination_passed": False,
-                "intermediate_steps": [UIEventTypes.CHECKING_HALLUCINATION],
-            }
-            self._save_node_checkpoint(
-                self._snapshot_with_updates(state, updates),
-                NodeNames.GRADE_HALLUCINATION,
-                phase="end",
-            )
-            return updates
-
         updates = {
-            "hallucination_passed": True,
-            "intermediate_steps": [UIEventTypes.CHECKING_HALLUCINATION],
+            "generation": answer,
+            "handoff_synth": handoff_synth,
+            "synth_scratchpad": {
+                "law_sources": len(law_sources),
+                "tool_contexts": len(tool_contexts),
+                "memory_contexts": len(memory_contexts),
+                "metrics": synth_metrics,
+            },
+            "intermediate_steps": [UIEventTypes.SYNTHESIZING],
         }
         self._save_node_checkpoint(
             self._snapshot_with_updates(state, updates),
-            NodeNames.GRADE_HALLUCINATION,
+            NodeNames.SYNTH_AGENT,
             phase="end",
         )
         return updates
 
-    # ==========================================
-    # 路由逻辑 (Conditional Routing)
-    # ==========================================
+    async def node_judge_agent(self, state: AgenticState):
+        self._save_node_checkpoint(state, NodeNames.JUDGE_AGENT, phase="start")
+        handoff_router = state.get("handoff_router", {}) or {}
+        need_law = bool(handoff_router.get("need_law"))
+        documents = state.get("private_documents", [])
+        law_sources = state.get("public_sources", [])
+        generation = state.get("generation", "")
 
-    def route_from_bootstrap(self, state: AgenticState) -> Literal[
-        NodeNames.AGENT,
-        NodeNames.ACTION,
-        NodeNames.GRADE_DOCS,
-        NodeNames.REWRITE,
-        NodeNames.RETRIEVE_RETRY,
-        NodeNames.GENERATE,
-        NodeNames.GRADE_HALLUCINATION,
+        passed = True
+        issues = []
+        if need_law and not (law_sources or documents):
+            passed = False
+            issues.append("法律任务缺少有效法规证据")
+
+        if documents and generation:
+            prompt = ExpertPrompts.HALLUCINATION_GRADER.format(
+                documents="\n".join(documents),
+                generation=generation,
+            )
+            judge_result, judge_metrics, judge_err = await self._run_guarded(
+                "judge",
+                "fact_consistency",
+                lambda: self.json_llm.ainvoke(prompt),
+            )
+            if judge_result is not None and not judge_err:
+                score = self._extract_json_score(judge_result.content, default=GraderThresholds.SCORE_YES)
+                if score == GraderThresholds.SCORE_NO:
+                    passed = False
+                    issues.append("回答与证据一致性不足")
+            elif judge_err:
+                logger.warning(f"judge_agent 幻觉检查异常，保守放行: {judge_err}")
+                judge_metrics = {
+                    "agent": "judge",
+                    "operation": "fact_consistency",
+                    "success": False,
+                    "error": judge_err,
+                }
+        else:
+            judge_metrics = {
+                "agent": "judge",
+                "operation": "fact_consistency",
+                "skipped": True,
+                "reason": "no_documents_or_generation",
+            }
+
+        handoff_judge = JudgeAgentSubgraph.build_handoff(passed=passed, issues=issues)
+        final_generation = generation
+        if not passed:
+            final_generation = (
+                "当前结果未通过事实一致性审查，已拦截输出。"
+                "请补充更明确的场景信息后重试。"
+            )
+
+        updates = {
+            "generation": final_generation,
+            "hallucination_passed": bool(passed),
+            "handoff_judge": handoff_judge,
+            "judge_scratchpad": {
+                "issues_count": len(issues),
+                "risk_level": handoff_judge["risk_level"],
+                "metrics": judge_metrics,
+            },
+            "intermediate_steps": [UIEventTypes.JUDGING],
+        }
+        self._save_node_checkpoint(
+            self._snapshot_with_updates(state, updates),
+            NodeNames.JUDGE_AGENT,
+            phase="end",
+        )
+        return updates
+
+    def route_from_bootstrap(
+        self, state: AgenticState
+    ) -> Literal[
+        NodeNames.ROUTER_AGENT,
+        NodeNames.LAW_AGENT,
+        NodeNames.TOOL_AGENT,
+        NodeNames.SYNTH_AGENT,
+        NodeNames.JUDGE_AGENT,
     ]:
         resume_from = str(state.get("resume_from_node", "") or "").strip()
         allowed = {
-            NodeNames.AGENT,
-            NodeNames.ACTION,
-            NodeNames.GRADE_DOCS,
-            NodeNames.REWRITE,
-            NodeNames.RETRIEVE_RETRY,
-            NodeNames.GENERATE,
-            NodeNames.GRADE_HALLUCINATION,
+            NodeNames.ROUTER_AGENT,
+            NodeNames.LAW_AGENT,
+            NodeNames.TOOL_AGENT,
+            NodeNames.SYNTH_AGENT,
+            NodeNames.JUDGE_AGENT,
+        }
+        legacy_map = {
+            NodeNames.AGENT: NodeNames.ROUTER_AGENT,
+            NodeNames.ACTION: NodeNames.TOOL_AGENT,
+            NodeNames.GRADE_DOCS: NodeNames.LAW_AGENT,
+            NodeNames.REWRITE: NodeNames.ROUTER_AGENT,
+            NodeNames.RETRIEVE_RETRY: NodeNames.LAW_AGENT,
+            NodeNames.GENERATE: NodeNames.SYNTH_AGENT,
+            NodeNames.GRADE_HALLUCINATION: NodeNames.JUDGE_AGENT,
         }
         if resume_from in allowed:
             logger.warning(f"[恢复执行] 从断点节点恢复: {resume_from}")
             return resume_from  # type: ignore[return-value]
-        return NodeNames.AGENT
-
-    def route_from_agent(self, state: AgenticState) -> Literal[NodeNames.ACTION, NodeNames.GENERATE]:
-        messages = state.get("messages", [])
-        if not messages:
-            return NodeNames.GENERATE
-        last_message = messages[-1]
-        if getattr(last_message, "tool_calls", None):
-            return NodeNames.ACTION
-        return NodeNames.GENERATE
-
-    def route_from_action(self, state: AgenticState) -> Literal[NodeNames.GRADE_DOCS, NodeNames.GENERATE]:
-        #路由逻辑：根据本次执行的工具集决定下一步
-        latest_tool_names = state.get("private_latest_tool_names", [])
-        if not latest_tool_names:
-            return NodeNames.GENERATE
-
-        # 只要这一批工具调用中包含"法规检索"，就必须走打分车道审核
-        for tool_name in latest_tool_names:
-            # 使用常量进行判断，解耦硬编码
-            if tool_name == AgentToolNames.LAW_SEARCH:
-                print(f"⚖️ [路由决策] 检测到法律检索行为，引导至 {NodeNames.GRADE_DOCS} 节点")
-                return NodeNames.GRADE_DOCS
-
-        # 纯生活服务/导航类请求，走生成快车道
-        print(f"🚀 [路由决策] 纯外部工具调用，引导至 {NodeNames.GENERATE} 节点")
-        return NodeNames.GENERATE
-
-    def route_from_grade_docs(self, state: AgenticState) -> Literal[NodeNames.REWRITE, NodeNames.GENERATE]:
-        documents = state.get("private_documents", [])
-        if not documents:
-            return NodeNames.REWRITE
-        return NodeNames.GENERATE
-
-    def route_from_rewrite(self, state: AgenticState) -> Literal[NodeNames.RETRIEVE_RETRY, NodeNames.GENERATE]:
-        retries = state.get("relevance_retries", 0)
-        # 超过上限硬性切断死循环
-        if retries >= AgentLimits.MAX_RELEVANCE_RETRIES:
-            logger.warning("达到最大相关性重试次数，强制终止检索阶段。")
-            return NodeNames.GENERATE
-        return NodeNames.RETRIEVE_RETRY
-
-    def route_from_grade_hallucination(self, state: AgenticState) -> Literal[NodeNames.REWRITE, END]:
-        hallucination_passed = state.get("hallucination_passed", True)
-        if hallucination_passed:
-            return END
-
-        retries = state.get("hallucination_retries", 0)
-        # 如果发现幻觉，打回重写逻辑（若已达上限则放行，前端提示可能存在风险）
-        if retries < AgentLimits.MAX_HALLUCINATION_RETRIES:
-            return NodeNames.REWRITE
-        return END
+        if resume_from in legacy_map:
+            mapped = legacy_map[resume_from]
+            logger.warning(f"[恢复执行] 旧节点 {resume_from} 映射到新节点 {mapped}")
+            return mapped  # type: ignore[return-value]
+        return NodeNames.ROUTER_AGENT
 
     def _build_graph(self) -> StateGraph:
         workflow = StateGraph(AgenticState)
 
         workflow.add_node(NodeNames.BOOTSTRAP, self.node_bootstrap)
-        workflow.add_node(NodeNames.AGENT, self.node_agent)
-        workflow.add_node(NodeNames.ACTION, self.node_action)
-        workflow.add_node(NodeNames.GRADE_DOCS, self.node_grade_docs)
-        workflow.add_node(NodeNames.REWRITE, self.node_rewrite)
-        workflow.add_node(NodeNames.RETRIEVE_RETRY, self.node_retrieve_retry)
-        workflow.add_node(NodeNames.GENERATE, self.node_generate)
-        workflow.add_node(NodeNames.GRADE_HALLUCINATION, self.node_grade_hallucination)
+        workflow.add_node(NodeNames.ROUTER_AGENT, self.node_router_agent)
+        workflow.add_node(NodeNames.LAW_AGENT, self.node_law_agent)
+        workflow.add_node(NodeNames.TOOL_AGENT, self.node_tool_agent)
+        workflow.add_node(NodeNames.SYNTH_AGENT, self.node_synth_agent)
+        workflow.add_node(NodeNames.JUDGE_AGENT, self.node_judge_agent)
 
         workflow.set_entry_point(NodeNames.BOOTSTRAP)
-
         workflow.add_conditional_edges(NodeNames.BOOTSTRAP, self.route_from_bootstrap)
-        workflow.add_conditional_edges(NodeNames.AGENT, self.route_from_agent)
-        workflow.add_conditional_edges(NodeNames.ACTION, self.route_from_action)
-        workflow.add_conditional_edges(NodeNames.GRADE_DOCS, self.route_from_grade_docs)
-        workflow.add_conditional_edges(NodeNames.REWRITE, self.route_from_rewrite)
 
-        workflow.add_edge(NodeNames.RETRIEVE_RETRY, NodeNames.GRADE_DOCS)
-        workflow.add_edge(NodeNames.GENERATE, NodeNames.GRADE_HALLUCINATION)
-        workflow.add_conditional_edges(NodeNames.GRADE_HALLUCINATION, self.route_from_grade_hallucination)
+        # router 分配后，law/tool 并行执行（不需要的分支自行 no-op）
+        workflow.add_edge(NodeNames.ROUTER_AGENT, NodeNames.LAW_AGENT)
+        workflow.add_edge(NodeNames.ROUTER_AGENT, NodeNames.TOOL_AGENT)
+
+        # synth 汇总两个分支
+        workflow.add_edge(NodeNames.LAW_AGENT, NodeNames.SYNTH_AGENT)
+        workflow.add_edge(NodeNames.TOOL_AGENT, NodeNames.SYNTH_AGENT)
+
+        # judge 最终把关
+        workflow.add_edge(NodeNames.SYNTH_AGENT, NodeNames.JUDGE_AGENT)
+        workflow.add_edge(NodeNames.JUDGE_AGENT, END)
 
         return workflow.compile()
