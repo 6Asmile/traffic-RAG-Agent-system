@@ -1,6 +1,7 @@
 from datetime import datetime
 
 from sqlalchemy import Boolean, Column, DateTime, Integer, String, Text
+from sqlalchemy.dialects.mysql import LONGTEXT
 
 from app.db.base import Base
 
@@ -43,7 +44,7 @@ class AgentRunCheckpoint(Base):
     status = Column(String(32), index=True, nullable=False, default="running")
     error = Column(Text, nullable=False, default="")
 
-    state_json = Column(Text, nullable=False, default="{}")
+    state_json = Column(Text().with_variant(LONGTEXT(), "mysql"), nullable=False, default="{}")
     created_at = Column(DateTime, default=datetime.now, index=True)
 
 

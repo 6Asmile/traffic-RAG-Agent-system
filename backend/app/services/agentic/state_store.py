@@ -27,6 +27,14 @@ class AgentStateStore:
     MEMORY_MAX_ITEMS = 80
     TIMELINE_MAX_ITEMS = 200
     DB_TABLES_READY = False
+    DB_STATE_JSON_MAX_BYTES = 48 * 1024
+    MSG_MAX_ITEMS = 12
+    HISTORY_MSG_MAX_ITEMS = 10
+    DOC_MAX_ITEMS = 8
+    SOURCE_MAX_ITEMS = 8
+    TOOL_CTX_MAX_ITEMS = 8
+    MEMORY_CTX_MAX_ITEMS = 6
+    INTERMEDIATE_MAX_ITEMS = 20
 
     def __init__(self, redis_client=None, db: Optional[Session] = None):
         self.redis_client = redis_client
@@ -132,6 +140,220 @@ class AgentStateStore:
             return [cls._sanitize_value(v) for v in value]
         return str(value)
 
+    @staticmethod
+    def _truncate_text(text: Any, max_chars: int) -> str:
+        raw = str(text or "")
+        if max_chars <= 0 or len(raw) <= max_chars:
+            return raw
+        return raw[: max_chars - 3] + "..."
+
+    @classmethod
+    def _trim_list(cls, values: Any, max_items: int) -> list:
+        if not isinstance(values, list):
+            return []
+        if max_items <= 0 or len(values) <= max_items:
+            return values
+        return values[-max_items:]
+
+    @classmethod
+    def _compact_messages(cls, messages: Any, max_items: int, max_chars: int) -> list:
+        compacted = []
+        for item in cls._trim_list(messages if isinstance(messages, list) else [], max_items):
+            if not isinstance(item, dict):
+                continue
+            kind = str(item.get("kind", "unknown") or "unknown")
+            content_cap = max_chars if kind != "tool" else min(max_chars, 320)
+            compact = {
+                "kind": kind,
+                "content": cls._truncate_text(item.get("content", ""), content_cap),
+            }
+            tool_call_id = str(item.get("tool_call_id") or "").strip()
+            if tool_call_id:
+                compact["tool_call_id"] = cls._truncate_text(tool_call_id, 120)
+            if kind == "ai" and isinstance(item.get("tool_calls"), list):
+                compact["tool_calls"] = cls._trim_list(item.get("tool_calls"), 4)
+            compacted.append(compact)
+        return compacted
+
+    @classmethod
+    def _compact_sources(cls, sources: Any, max_items: int, content_chars: int) -> list:
+        compacted = []
+        for item in cls._trim_list(sources if isinstance(sources, list) else [], max_items):
+            if not isinstance(item, dict):
+                continue
+            compacted.append(
+                {
+                    "type": cls._truncate_text(item.get("type", ""), 24),
+                    "title": cls._truncate_text(item.get("title", ""), 120),
+                    "label": cls._truncate_text(item.get("label", ""), 120),
+                    "law_name": cls._truncate_text(item.get("law_name", ""), 120),
+                    "article_no": cls._truncate_text(item.get("article_no", ""), 80),
+                    "content": cls._truncate_text(item.get("content", ""), content_chars),
+                }
+            )
+        return compacted
+
+    @classmethod
+    def _compact_scratchpad(cls, value: Any, max_depth: int = 3):
+        if max_depth <= 0:
+            return None
+        if value is None or isinstance(value, (int, float, bool)):
+            return value
+        if isinstance(value, str):
+            return cls._truncate_text(value, 320)
+        if isinstance(value, list):
+            return [
+                cls._compact_scratchpad(v, max_depth - 1)
+                for v in cls._trim_list(value, 8)
+            ]
+        if isinstance(value, dict):
+            compacted = {}
+            for index, (k, v) in enumerate(value.items()):
+                if index >= 20:
+                    break
+                compacted[str(k)] = cls._compact_scratchpad(v, max_depth - 1)
+            return compacted
+        return cls._truncate_text(value, 320)
+
+    @classmethod
+    def _compact_state_for_checkpoint(cls, state: dict, aggressive: bool = False) -> dict:
+        if not isinstance(state, dict):
+            return {}
+
+        def _to_int(value: Any, default: int = 0) -> int:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return default
+
+        msg_max = 6 if aggressive else cls.MSG_MAX_ITEMS
+        hist_max = 6 if aggressive else cls.HISTORY_MSG_MAX_ITEMS
+        doc_max = 4 if aggressive else cls.DOC_MAX_ITEMS
+        source_max = 4 if aggressive else cls.SOURCE_MAX_ITEMS
+        tool_ctx_max = 4 if aggressive else cls.TOOL_CTX_MAX_ITEMS
+        mem_ctx_max = 3 if aggressive else cls.MEMORY_CTX_MAX_ITEMS
+        msg_chars = 360 if aggressive else 800
+        doc_chars = 360 if aggressive else 1200
+        source_chars = 320 if aggressive else 900
+        ctx_chars = 280 if aggressive else 700
+
+        compacted = {
+            "run_id": cls._truncate_text(state.get("run_id", ""), 120),
+            "session_id": cls._truncate_text(state.get("session_id", ""), 80),
+            "user_id": cls._truncate_text(state.get("user_id", ""), 64),
+            "checkpoint_recovered": bool(state.get("checkpoint_recovered", False)),
+            "original_query": cls._truncate_text(state.get("original_query", ""), 1200),
+            "search_query": cls._truncate_text(state.get("search_query", ""), 1200),
+            "memory_summary": cls._truncate_text(state.get("memory_summary", ""), 1200),
+            "generation": cls._truncate_text(state.get("generation", ""), 2200 if aggressive else 6000),
+            "hallucination_passed": bool(state.get("hallucination_passed", True)),
+            "relevance_retries": _to_int(state.get("relevance_retries", 0), default=0),
+            "hallucination_retries": _to_int(state.get("hallucination_retries", 0), default=0),
+            "resume_from_node": cls._truncate_text(state.get("resume_from_node", ""), 80),
+            "messages": cls._compact_messages(state.get("messages", []), msg_max, msg_chars),
+            "history_messages": cls._compact_messages(state.get("history_messages", []), hist_max, msg_chars),
+            "private_documents": [
+                cls._truncate_text(text, doc_chars)
+                for text in cls._trim_list(state.get("private_documents", []), doc_max)
+                if str(text or "").strip()
+            ],
+            "public_sources": cls._compact_sources(state.get("public_sources", []), source_max, source_chars),
+            "private_tool_contexts": [
+                cls._truncate_text(text, ctx_chars)
+                for text in cls._trim_list(state.get("private_tool_contexts", []), tool_ctx_max)
+                if str(text or "").strip()
+            ],
+            "private_memory_contexts": [
+                cls._truncate_text(text, 260 if aggressive else 500)
+                for text in cls._trim_list(state.get("private_memory_contexts", []), mem_ctx_max)
+                if str(text or "").strip()
+            ],
+            "private_latest_tool_names": [
+                cls._truncate_text(name, 64)
+                for name in cls._trim_list(state.get("private_latest_tool_names", []), 8)
+                if str(name or "").strip()
+            ],
+            "handoff_router": cls._compact_scratchpad(state.get("handoff_router", {})),
+            "handoff_law": cls._compact_scratchpad(state.get("handoff_law", {})),
+            "handoff_tool": cls._compact_scratchpad(state.get("handoff_tool", {})),
+            "handoff_synth": cls._compact_scratchpad(state.get("handoff_synth", {})),
+            "handoff_judge": cls._compact_scratchpad(state.get("handoff_judge", {})),
+            "router_scratchpad": cls._compact_scratchpad(state.get("router_scratchpad", {})),
+            "law_scratchpad": cls._compact_scratchpad(state.get("law_scratchpad", {})),
+            "tool_scratchpad": cls._compact_scratchpad(state.get("tool_scratchpad", {})),
+            "synth_scratchpad": cls._compact_scratchpad(state.get("synth_scratchpad", {})),
+            "judge_scratchpad": cls._compact_scratchpad(state.get("judge_scratchpad", {})),
+            "intermediate_steps": [
+                cls._truncate_text(step, 80)
+                for step in cls._trim_list(state.get("intermediate_steps", []), cls.INTERMEDIATE_MAX_ITEMS)
+                if str(step or "").strip()
+            ],
+        }
+        compacted["checkpoint_meta"] = {
+            "compacted": True,
+            "aggressive": aggressive,
+            "max_bytes": cls.DB_STATE_JSON_MAX_BYTES,
+        }
+        return compacted
+
+    @classmethod
+    def _serialize_checkpoint_state(cls, state: dict) -> str:
+        compacted = cls._compact_state_for_checkpoint(state, aggressive=False)
+        payload = json.dumps(compacted, ensure_ascii=False)
+        if len(payload.encode("utf-8")) <= cls.DB_STATE_JSON_MAX_BYTES:
+            return payload
+
+        compacted = cls._compact_state_for_checkpoint(state, aggressive=True)
+        payload = json.dumps(compacted, ensure_ascii=False)
+        if len(payload.encode("utf-8")) <= cls.DB_STATE_JSON_MAX_BYTES:
+            return payload
+
+        minimal = {
+            "run_id": cls._truncate_text(state.get("run_id", ""), 120),
+            "session_id": cls._truncate_text(state.get("session_id", ""), 80),
+            "user_id": cls._truncate_text(state.get("user_id", ""), 64),
+            "original_query": cls._truncate_text(state.get("original_query", ""), 800),
+            "search_query": cls._truncate_text(state.get("search_query", ""), 800),
+            "generation": cls._truncate_text(state.get("generation", ""), 1200),
+            "messages": cls._compact_messages(state.get("messages", []), 4, 220),
+            "public_sources": cls._compact_sources(state.get("public_sources", []), 2, 180),
+            "private_documents": [
+                cls._truncate_text(text, 180)
+                for text in cls._trim_list(state.get("private_documents", []), 2)
+                if str(text or "").strip()
+            ],
+            "private_tool_contexts": [
+                cls._truncate_text(text, 180)
+                for text in cls._trim_list(state.get("private_tool_contexts", []), 2)
+                if str(text or "").strip()
+            ],
+            "hallucination_passed": bool(state.get("hallucination_passed", True)),
+            "checkpoint_meta": {
+                "compacted": True,
+                "aggressive": True,
+                "fallback_minimal": True,
+                "max_bytes": cls.DB_STATE_JSON_MAX_BYTES,
+            },
+        }
+        payload = json.dumps(minimal, ensure_ascii=False)
+        payload_bytes = payload.encode("utf-8")
+        if len(payload_bytes) <= cls.DB_STATE_JSON_MAX_BYTES:
+            return payload
+
+        ultra_minimal = {
+            "run_id": cls._truncate_text(state.get("run_id", ""), 120),
+            "session_id": cls._truncate_text(state.get("session_id", ""), 80),
+            "user_id": cls._truncate_text(state.get("user_id", ""), 64),
+            "checkpoint_meta": {
+                "compacted": True,
+                "aggressive": True,
+                "fallback_minimal": True,
+                "truncated": True,
+                "max_bytes": cls.DB_STATE_JSON_MAX_BYTES,
+            },
+        }
+        return json.dumps(ultra_minimal, ensure_ascii=False)
+
     @classmethod
     def _restore_state(cls, state: dict) -> dict:
         restored = dict(state or {})
@@ -218,6 +440,7 @@ class AgentStateStore:
             return
 
         cleaned_state = self._sanitize_value(state or {})
+        serialized_state = self._serialize_checkpoint_state(cleaned_state)
         payload = {
             "run_id": run_id,
             "last_node": str(node_name or ""),
@@ -225,7 +448,7 @@ class AgentStateStore:
             "status": str(status or "running"),
             "updated_at": str(int(time.time())),
             "error": str(error or ""),
-            "state_json": json.dumps(cleaned_state, ensure_ascii=False),
+            "state_json": serialized_state,
         }
         run_key = self._build_run_key(run_id)
         timeline_key = self._build_timeline_key(run_id)
