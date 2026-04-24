@@ -30,6 +30,17 @@ from app.db.session import SessionLocal
 from app.models import User
 from app.models.knowledge import KnowledgeDoc
 from app.services.cache_service import CacheManager
+from app.services.chat_history_utils import (
+    append_history_entries,
+    build_scoped_redis_key,
+    build_langchain_messages,
+    dump_history_entries,
+    load_history_entries,
+    load_history_summary,
+    maybe_compact_history_entries,
+    merge_history_summary,
+    render_history_context,
+)
 from app.services.config_service import ConfigService
 from app.services.tool_service import agent_get_route, agent_search_nearby, agent_get_weather
 
@@ -108,6 +119,7 @@ class AliyunReranker:
 class RAGService:
     def __init__(self, db: Session, current_user: User = None):
         self.db = db
+        self.current_user_id = getattr(current_user, "id", None)
         emb_cfg = ConfigService.get_active_config(db, "embedding")
         llm_cfg = ConfigService.get_active_config(db, "llm")
         if not emb_cfg or not llm_cfg:
@@ -149,6 +161,45 @@ class RAGService:
         self.bm25_instance = None
         self.bm25_corpus = []
         self._init_bm25()
+
+    def _build_memory_keys(self, session_id: str) -> tuple[str, str]:
+        history_key = build_scoped_redis_key(RedisKeys.CHAT_HISTORY, session_id, self.current_user_id)
+        summary_key = build_scoped_redis_key(RedisKeys.CHAT_SUMMARY, session_id, self.current_user_id)
+        return history_key, summary_key
+
+    def _persist_history_with_summary(
+        self,
+        history_key: str,
+        summary_key: str,
+        history_entries: list[dict],
+        query: str,
+        full_answer: str,
+    ):
+        if not self.redis_client:
+            return
+
+        history_list = append_history_entries(
+            history_entries,
+            query,
+            full_answer,
+            RedisKeys.MAX_HISTORY_LENGTH,
+        )
+        compacted_entries, archived_entries = maybe_compact_history_entries(
+            history_list,
+            RedisKeys.SUMMARY_TRIGGER_TURNS,
+            RedisKeys.SUMMARY_KEEP_TURNS,
+        )
+
+        if archived_entries:
+            summary_text = load_history_summary(self.redis_client, summary_key)
+            merged_summary = merge_history_summary(summary_text, archived_entries)
+            self.redis_client.setex(summary_key, RedisKeys.HISTORY_EXPIRE_SECONDS, merged_summary)
+
+        self.redis_client.setex(
+            history_key,
+            RedisKeys.HISTORY_EXPIRE_SECONDS,
+            dump_history_entries(compacted_entries),
+        )
 
     def strict_clean(self, text: str) -> str:
         if not text: return ""
@@ -346,30 +397,19 @@ class RAGService:
 
         # 2. 获取历史记录并构建 Context
         # 使用常量替换历史记录键名
-        history_key = RedisKeys.CHAT_HISTORY.format(session_id=session_id)
-        chat_history_objs = []
-        history_str_for_rewrite = ""
-        history_list = []
-
-        if self.redis_client:
-            raw = self.redis_client.get(history_key)
-            if raw:
-                # 使用常量替换硬编码的数量限制
-                history_list = json.loads(raw)[-RedisKeys.MAX_HISTORY_LENGTH:]
-                history_str_for_rewrite = "\n".join(
-                    [f"{'用户' if i % 2 == 0 else '助手'}: {msg}" for i, msg in enumerate(history_list)])
-
-                for i, msg in enumerate(history_list):
-                    if i % 2 == 0:
-                        chat_history_objs.append(HumanMessage(content=msg))
-                    else:
-                        chat_history_objs.append(AIMessage(content=msg))
+        history_key, summary_key = self._build_memory_keys(session_id)
+        history_entries = load_history_entries(self.redis_client, history_key, RedisKeys.MAX_HISTORY_LENGTH)
+        history_summary = load_history_summary(self.redis_client, summary_key)
+        chat_history_objs = build_langchain_messages(history_entries)
+        history_context_text = render_history_context(history_entries, history_summary)
+        if history_summary:
+            chat_history_objs = [SystemMessage(content=f"历史摘要：\n{history_summary}")] + chat_history_objs
 
         search_query = query
-        if history_list:
+        if history_context_text:
             try:
                 rewrite_res = self.rewriter_llm.invoke(
-                    QUERY_REWRITE_PROMPT.format(history=history_str_for_rewrite, query=query))
+                    QUERY_REWRITE_PROMPT.format(history=history_context_text, query=query))
                 search_query = rewrite_res.content.strip().replace('"', '')
                 print(f"🔍 [改写后] {search_query}")
             except:
@@ -437,10 +477,13 @@ class RAGService:
                         yield json.dumps({"type": "content", "data": clean_content}, ensure_ascii=False)
 
                 if self.redis_client:
-                    history_list.extend([f"用户: {query}", f"助手: {full_answer}"])
-                    # 使用常量替换时间
-                    self.redis_client.setex(history_key, RedisKeys.HISTORY_EXPIRE_SECONDS,
-                                            json.dumps(history_list[-RedisKeys.MAX_HISTORY_LENGTH * 2:]))
+                    self._persist_history_with_summary(
+                        history_key,
+                        summary_key,
+                        history_entries,
+                        query,
+                        full_answer,
+                    )
 
                 yield json.dumps({"type": "done", "full_answer": full_answer})
                 return
@@ -508,7 +551,7 @@ class RAGService:
         # 8. RAG 回答生成
         context = "\n".join([f"[资料{i + 1}]: {d}" for i, d in enumerate(final_docs)])
         final_prompt = RAG_SYSTEM_PROMPT.format(
-            context=context, graph_context=graph_context, history="\n".join(history_list), query=query
+            context=context, graph_context=graph_context, history=history_context_text, query=query
         )
 
         full_answer = ""
@@ -521,10 +564,13 @@ class RAGService:
 
             self.cache.set_semantic_cache(q_vec, full_answer, final_docs)
             if self.redis_client:
-                history_list.extend([f"用户: {query}", f"助手: {full_answer}"])
-                # 使用常量替换
-                self.redis_client.setex(history_key, RedisKeys.HISTORY_EXPIRE_SECONDS,
-                                        json.dumps(history_list[-RedisKeys.MAX_HISTORY_LENGTH * 2:]))
+                self._persist_history_with_summary(
+                    history_key,
+                    summary_key,
+                    history_entries,
+                    query,
+                    full_answer,
+                )
 
             yield json.dumps({"type": "done", "full_answer": full_answer})
         except Exception as e:

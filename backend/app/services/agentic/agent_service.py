@@ -15,6 +15,16 @@ from app.core.agentic.agent_constants import UIEventTypes, NodeNames, AgentToolN
 from app.core.constants import RedisKeys, SystemConfig, AIModelConstants
 from app.services.config_service import ConfigService
 from app.services.cache_service import CacheManager
+from app.services.chat_history_utils import (
+    append_history_entries,
+    build_scoped_redis_key,
+    build_langchain_messages,
+    dump_history_entries,
+    load_history_entries,
+    load_history_summary,
+    maybe_compact_history_entries,
+    merge_history_summary,
+)
 from app.services.rag_service import AliyunEmbeddingWrapper, AliyunReranker
 
 from app.skills.law_skills import create_law_search_tool
@@ -27,6 +37,7 @@ logger = logging.getLogger(__name__)
 class AgenticRAGService:
     def __init__(self, db: Session, current_user=None):
         self.db = db
+        self.current_user_id = getattr(current_user, "id", None)
         emb_cfg = ConfigService.get_active_config(db, "embedding")
         llm_cfg = ConfigService.get_active_config(db, "llm")
         if not emb_cfg or not llm_cfg:
@@ -79,6 +90,45 @@ class AgenticRAGService:
         )
         print("🤖[Agentic] 专家模式工作流引擎初始化完毕")
 
+    def _build_memory_keys(self, session_id: str) -> tuple[str, str]:
+        history_key = build_scoped_redis_key(RedisKeys.CHAT_HISTORY, session_id, self.current_user_id)
+        summary_key = build_scoped_redis_key(RedisKeys.CHAT_SUMMARY, session_id, self.current_user_id)
+        return history_key, summary_key
+
+    def _persist_history_with_summary(
+        self,
+        history_key: str,
+        summary_key: str,
+        history_entries: list[dict],
+        query: str,
+        full_answer: str,
+    ):
+        if not self.redis_client:
+            return
+
+        history_list = append_history_entries(
+            history_entries,
+            query,
+            full_answer,
+            RedisKeys.MAX_HISTORY_LENGTH,
+        )
+        compacted_entries, archived_entries = maybe_compact_history_entries(
+            history_list,
+            RedisKeys.SUMMARY_TRIGGER_TURNS,
+            RedisKeys.SUMMARY_KEEP_TURNS,
+        )
+
+        if archived_entries:
+            summary_text = load_history_summary(self.redis_client, summary_key)
+            merged_summary = merge_history_summary(summary_text, archived_entries)
+            self.redis_client.setex(summary_key, RedisKeys.HISTORY_EXPIRE_SECONDS, merged_summary)
+
+        self.redis_client.setex(
+            history_key,
+            RedisKeys.HISTORY_EXPIRE_SECONDS,
+            dump_history_entries(compacted_entries),
+        )
+
     def _init_bm25(self):
         try:
             from app.models.knowledge import KnowledgeDoc
@@ -101,120 +151,184 @@ class AgenticRAGService:
         print(f"👤 用户问题: {query}")
 
         # 获取上下文记忆
-        history_key = RedisKeys.CHAT_HISTORY.format(session_id=session_id)
-        chat_history_objs = []
-        if self.redis_client:
-            raw = self.redis_client.get(history_key)
-            if raw:
-                history_list = json.loads(raw)[-RedisKeys.MAX_HISTORY_LENGTH:]
-                print(f"📚 [记忆加载] 已挂载最近 {len(history_list)} 条历史对话")
-                for i, msg in enumerate(history_list):
-                    if i % 2 == 0:
-                        chat_history_objs.append(HumanMessage(content=msg))
-                    else:
-                        chat_history_objs.append(AIMessage(content=msg))
+        history_key, summary_key = self._build_memory_keys(session_id)
+        history_entries = load_history_entries(self.redis_client, history_key, RedisKeys.MAX_HISTORY_LENGTH)
+        history_summary = load_history_summary(self.redis_client, summary_key)
+        chat_history_objs = build_langchain_messages(history_entries)
+        if history_entries:
+            print(f"📚 [记忆加载] 已挂载最近 {len(history_entries)} 条历史对话")
+        if history_summary:
+            print("📝 [摘要记忆] 已加载历史摘要上下文")
 
         # 构建图的初始状态
         initial_state = {
-            "messages": chat_history_objs + [HumanMessage(content=query)],
+            "messages": [HumanMessage(content=query)],
+            "history_messages": chat_history_objs,
+            "memory_summary": history_summary,
             "original_query": query,
             "search_query": query,
-            "documents": [],
-            "retries": 0,
+            "private_documents": [],
+            "public_sources": [],
+            "private_tool_contexts": [],
+            "private_latest_tool_names": [],
+            "relevance_retries": 0,
+            "hallucination_retries": 0,
             "generation": "",
+            "hallucination_passed": True,
             "intermediate_steps": []
         }
 
         full_answer = ""
-        emitted_steps = set()  # 防止同一事件向前端重复发送
-        sources_emitted = False  # 锁：记录是否已发送了引用依据
-        final_documents = []
+        emitted_steps = set()  # 使用复合键 "{step_msg}|r{relevance}|h{hallucination}" 防止重试时 UI 状态不可见
+        final_sources = []
+        last_sources_payload = None
+        done_sent = False
 
         print("🚀 [Agentic] 正在启动 LangGraph 状态机流转...")
 
-        # 核心事件解析器
-        async for event in self.workflow_manager.graph.astream_events(initial_state, version="v2"):
-            kind = event["event"]
-            name = event.get("name", "")
+        try:
+            # 核心事件解析器
+            async for event in self.workflow_manager.graph.astream_events(initial_state, version="v2"):
+                kind = event["event"]
+                name = event.get("name", "")
 
-            # 1. 状态变更提示 (向前端推送中间状态框)
-            if kind == "on_chain_start":
-                step_msg = ""
-                if name == NodeNames.GRADE_DOCS:
-                    step_msg = UIEventTypes.GRADING_DOCS
-                elif name == NodeNames.REWRITE:
-                    step_msg = UIEventTypes.REWRITING
-                elif name == NodeNames.RETRIEVE_RETRY:
-                    step_msg = UIEventTypes.RETRIEVING
-                elif name == NodeNames.GRADE_HALLUCINATION:
-                    step_msg = UIEventTypes.CHECKING_HALLUCINATION
+                # 1. 状态变更提示 (向前端推送中间状态框)
+                if kind == "on_chain_start":
+                    step_msg = ""
+                    if name == NodeNames.GRADE_DOCS:
+                        step_msg = UIEventTypes.GRADING_DOCS
+                    elif name == NodeNames.REWRITE:
+                        step_msg = UIEventTypes.REWRITING
+                    elif name == NodeNames.RETRIEVE_RETRY:
+                        step_msg = UIEventTypes.RETRIEVING
+                    elif name == NodeNames.GRADE_HALLUCINATION:
+                        step_msg = UIEventTypes.CHECKING_HALLUCINATION
 
-                if step_msg and step_msg not in emitted_steps:
-                    emitted_steps.add(step_msg)
-                    print(f"🚦 [状态流转] {step_msg}")
-                    yield json.dumps({"type": "content", "data": f"\n\n> ⚙️ {step_msg}\n\n"}, ensure_ascii=False)
+                    if step_msg:
+                        # 从事件 input 中读取当前重试计数，构建复合键
+                        node_input = event.get("data", {}).get("input", {})
+                        if isinstance(node_input, dict):
+                            rel_r = node_input.get("relevance_retries", 0)
+                            hal_r = node_input.get("hallucination_retries", 0)
+                        else:
+                            rel_r, hal_r = 0, 0
+                        composite_key = f"{step_msg}|r{rel_r}|h{hal_r}"
 
-                # 🌟 修复点 1：进入最终生成节点前，抓取检索到的文档并推给前端
-                if name == NodeNames.GENERATE:
-                    node_input = event.get("data", {}).get("input", {})
-                    if isinstance(node_input, dict) and "documents" in node_input:
-                        final_documents = node_input["documents"]
-                        if final_documents and not sources_emitted:
-                            print(f"📑 [推送依据] 发现 {len(final_documents)} 条有效法规切片，推送至前端引用面板")
-                            yield json.dumps({"type": "sources", "data": final_documents}, ensure_ascii=False)
-                            sources_emitted = True
+                        if composite_key not in emitted_steps:
+                            emitted_steps.add(composite_key)
+                            total_retries = rel_r + hal_r
+                            retry_suffix = f"（重试第{total_retries}次）" if total_retries > 0 else ""
+                            print(f"🚦 [状态流转] {step_msg}{retry_suffix}")
+                            yield json.dumps(
+                                {"type": "content", "data": f"\n\n> ⚙️ {step_msg}{retry_suffix}\n\n"},
+                                ensure_ascii=False,
+                            )
 
-            # 2. 工具执行完毕拦截
-            elif kind == "on_tool_end":
-                print(f"🛠️[工具完成] 工具 {name} 顺利执行完毕")
-                tool_output = event["data"].get("output", "")
-                if isinstance(tool_output, str):
-                    try:
-                        res_dict = json.loads(tool_output)
-                        if "html_widget" in res_dict:
-                            print("🗺️ [推送UI组件] 发现高级交互式卡片，推送渲染至前端")
-                            yield json.dumps({"type": "content", "data": res_dict["html_widget"] + "\n\n"},
-                                             ensure_ascii=False)
-                    except json.JSONDecodeError:
-                        pass
+                    # 进入最终生成节点前，抓取检索到的文档并推给前端
+                    if name == NodeNames.GENERATE:
+                        node_input = event.get("data", {}).get("input", {})
+                        if isinstance(node_input, dict):
+                            final_sources = node_input.get("public_sources") or [
+                                {"type": "law", "title": f"法规依据 {i + 1}", "label": f"检索片段 {i + 1}", "content": doc}
+                                for i, doc in enumerate(node_input.get("private_documents", []))
+                            ]
+                            payload = json.dumps(final_sources, ensure_ascii=False, sort_keys=True)
+                            if payload != last_sources_payload:
+                                print(f"📑 [推送依据] 发现 {len(final_sources)} 条有效法规切片，推送至前端引用面板")
+                                yield json.dumps({"type": "sources", "data": final_sources}, ensure_ascii=False)
+                                last_sources_payload = payload
 
-            # 3. 截获大模型生成节点，推送最终答案
-            elif kind == "on_chat_model_stream":
-                metadata = event.get("metadata", {})
-                langgraph_node = metadata.get("langgraph_node")
+                # 2. 工具执行完毕拦截
+                elif kind == "on_tool_end":
+                    print(f"🛠️[工具完成] 工具 {name} 顺利执行完毕")
+                    tool_output = event["data"].get("output", "")
+                    if isinstance(tool_output, str):
+                        try:
+                            res_dict = json.loads(tool_output)
+                            if "html_widget" in res_dict:
+                                print("🗺️ [推送UI组件] 发现高级交互式卡片，推送渲染至前端")
+                                yield json.dumps({"type": "content", "data": res_dict["html_widget"] + "\n\n"},
+                                                 ensure_ascii=False)
+                        except json.JSONDecodeError:
+                            pass
 
-                # 仅当模型处于最终生成阶段（GENERATE）才透传前端
-                if langgraph_node == NodeNames.GENERATE:
-                    chunk = event["data"]["chunk"]
-                    if chunk.content and isinstance(chunk.content, str):
-                        # 过滤阿里等模型的 DSML 内部思考脏数据
-                        clean_content = re.sub(r'<\|?DSML\|?.*?>', '', chunk.content, flags=re.IGNORECASE)
-                        clean_content = re.sub(r'</\|?DSML\|?.*?>', '', clean_content, flags=re.IGNORECASE)
+                # 3. 截获大模型生成节点，推送最终答案
+                elif kind == "on_chat_model_stream":
+                    metadata = event.get("metadata", {})
+                    langgraph_node = metadata.get("langgraph_node")
 
-                        if clean_content:
-                            full_answer += clean_content
-                            yield json.dumps({"type": "content", "data": clean_content}, ensure_ascii=False)
+                    # 仅当模型处于最终生成阶段（GENERATE）才透传前端
+                    if langgraph_node == NodeNames.GENERATE:
+                        chunk = event["data"]["chunk"]
+                        if chunk.content and isinstance(chunk.content, str):
+                            # 过滤阿里等模型的 DSML 内部思考脏数据
+                            clean_content = re.sub(r'<\|?DSML\|?.*?>', '', chunk.content, flags=re.IGNORECASE)
+                            clean_content = re.sub(r'</\|?DSML\|?.*?>', '', clean_content, flags=re.IGNORECASE)
 
-            # 4. 图谱流转结束时，如果前端还没收到 sources，发一个兜底数据
-            elif kind == "on_chain_end" and name == "LangGraph":
-                final_state = event.get("data", {}).get("output", {})
-                if isinstance(final_state, dict) and "documents" in final_state:
-                    final_documents = final_state["documents"]
+                            if clean_content:
+                                full_answer += clean_content
+                                yield json.dumps({"type": "content", "data": clean_content}, ensure_ascii=False)
 
-        # 🌟 修复点 2：兜底处理，确保不管怎样都闭环
-        if not sources_emitted:
-            print("ℹ️ [引用兜底] 推送最终状态中的引用依据给前端")
-            yield json.dumps({"type": "sources", "data": final_documents}, ensure_ascii=False)
+                # 4. 图谱流转结束时，如果前端还没收到 sources，发一个兜底数据
+                elif kind == "on_chain_end" and name == "LangGraph":
+                    final_state = event.get("data", {}).get("output", {})
+                    if isinstance(final_state, dict):
+                        final_sources = final_state.get("public_sources") or [
+                            {"type": "law", "title": f"法规依据 {i + 1}", "label": f"检索片段 {i + 1}", "content": doc}
+                            for i, doc in enumerate(final_state.get("private_documents", []))
+                        ]
 
-        # 结束处理，更新记忆
-        print("💾 [持久化] 正在保存上下文记忆，结束本轮对话流")
-        if self.redis_client and full_answer.strip():
-            history_list = []
-            raw = self.redis_client.get(history_key)
-            if raw: history_list = json.loads(raw)
-            history_list.extend([f"用户: {query}", f"助手: {full_answer}"])
-            self.redis_client.setex(history_key, RedisKeys.HISTORY_EXPIRE_SECONDS,
-                                    json.dumps(history_list[-RedisKeys.MAX_HISTORY_LENGTH * 2:]))
+                # 5. 图谱节点异常事件
+                elif kind == "on_chain_error":
+                    error_data = event.get("data", {})
+                    logger.error(f"LangGraph chain error: {error_data}")
+                    yield json.dumps(
+                        {"type": "content", "data": "\n\n> ⚠️ 处理过程中出现异常，正在尝试恢复...\n\n"},
+                        ensure_ascii=False,
+                    )
 
-        # 🌟 修复点 3：完美的完成信号，让前端结束 Loading
-        yield json.dumps({"type": "done", "full_answer": full_answer}, ensure_ascii=False)
+        except Exception as e:
+            logger.error(f"Agentic 流式处理异常: {e}")
+            try:
+                yield json.dumps(
+                    {"type": "content", "data": "\n\n> ⚠️ 系统处理异常，请稍后重试。\n\n"},
+                    ensure_ascii=False,
+                )
+            except GeneratorExit:
+                pass
+
+        finally:
+            # 兜底处理，确保不管怎样都闭环
+            final_payload = json.dumps(final_sources, ensure_ascii=False, sort_keys=True)
+            if final_payload != last_sources_payload:
+                print("ℹ️ [引用兜底] 推送最终状态中的引用依据给前端")
+                try:
+                    yield json.dumps({"type": "sources", "data": final_sources}, ensure_ascii=False)
+                except GeneratorExit:
+                    pass
+
+            # 全局召回指标汇总日志
+            print(
+                f"[Agentic汇总] query='{query[:50]}' | "
+                f"sources={len(final_sources)} | answer_len={len(full_answer)} | "
+                f"history_turns={len(history_entries) // 2}"
+            )
+
+            # 结束处理，更新记忆
+            print("💾 [持久化] 正在保存上下文记忆，结束本轮对话流")
+            if self.redis_client and full_answer.strip():
+                self._persist_history_with_summary(
+                    history_key,
+                    summary_key,
+                    history_entries,
+                    query,
+                    full_answer,
+                )
+
+            # 完成信号，让前端结束 Loading（确保仅发送一次）
+            if not done_sent:
+                done_sent = True
+                try:
+                    yield json.dumps({"type": "done", "full_answer": full_answer}, ensure_ascii=False)
+                except GeneratorExit:
+                    pass

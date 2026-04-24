@@ -69,11 +69,14 @@ class AIModelConstants:
 
 class RedisKeys:
     """Redis 缓存键名常量"""
-    CHAT_HISTORY = "chat_history:{session_id}"
+    CHAT_HISTORY = "chat_history:{user_id}:{session_id}"
+    CHAT_SUMMARY = "chat_summary:{user_id}:{session_id}"
     METRICS_TOTAL_QUERIES = "metrics:total_queries"
     METRICS_CACHE_HITS = "metrics:cache_hits"
     HISTORY_EXPIRE_SECONDS = 3600
     MAX_HISTORY_LENGTH = 8  # 历史记录保留的最大条数
+    SUMMARY_TRIGGER_TURNS = 6  # 超过该轮数后触发“滚动摘要压缩”
+    SUMMARY_KEEP_TURNS = 3  # 压缩后保留的最近轮数
 
 class QuizConstants:
     """题库生成配置常量"""
