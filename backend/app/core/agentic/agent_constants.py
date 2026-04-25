@@ -76,5 +76,5 @@ class RAGToolConfig:
     FAISS_TOP_K = 40
     BM25_TOP_N = 20
     RERANK_TOP_N = 10
-    SCORE_THRESHOLD = 0.05
+    SCORE_THRESHOLD = 0.5
     FALLBACK_MESSAGE = "抱歉，法律知识库中未检索到相关条款，请尝试更换关键词重新检索。"

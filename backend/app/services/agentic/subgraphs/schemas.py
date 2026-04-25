@@ -5,6 +5,7 @@ class RouterHandoff(TypedDict):
     task_type: Literal["law_only", "tool_only", "hybrid", "chat"]
     need_law: bool
     need_tool: bool
+    need_capabilities: List[str]
     reason_codes: List[str]
     rewritten_query: str
 

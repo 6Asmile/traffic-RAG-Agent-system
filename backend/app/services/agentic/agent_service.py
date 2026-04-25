@@ -27,10 +27,9 @@ from app.services.chat_history_utils import (
 )
 from app.services.rag_service import AliyunEmbeddingWrapper, AliyunReranker
 
-from app.skills.law_skills import create_law_search_tool
-from app.skills.amap_skills import create_amap_tools
 from app.services.agentic.agentic_workflow import AgenticWorkflowManager
 from app.services.agentic.state_store import AgentStateStore
+from app.services.agentic.tool_registry import ToolRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -82,14 +81,34 @@ class AgenticRAGService:
         self.bm25_instance = None
         self._init_bm25()
 
-        # 装配 Skills 与工作流
-        law_tool = create_law_search_tool(self.vector_db, self.bm25_instance, self.bm25_corpus, self.reranker)
-        all_tools = [law_tool] + create_amap_tools()
+        # 装配 Skills 与工作流（插件化注册加载）
+        self.tool_registry = ToolRegistry()
+        load_result = self.tool_registry.load_tools(
+            context={
+                "vector_db": self.vector_db,
+                "bm25_instance": self.bm25_instance,
+                "bm25_corpus": self.bm25_corpus,
+                "reranker": self.reranker,
+            }
+        )
+        all_tools = load_result.tools
+        self.tool_metadata_by_name = load_result.tool_metadata_by_name
+        self.tool_capability_to_tools = load_result.capability_to_tools
+        self.tool_capability_hints = load_result.capability_hints
+        if load_result.errors:
+            logger.warning(f"ToolRegistry 加载存在告警: {' | '.join(load_result.errors)}")
+        if all_tools:
+            loaded_names = ", ".join([str(getattr(t, 'name', '')) for t in all_tools])
+            print(f"🧩 [Tools] 插件化加载完成: {loaded_names}")
+        else:
+            print("🟡 [Tools] 未加载到任何插件工具，将仅保留基础对话能力")
 
         self.workflow_manager = AgenticWorkflowManager(
             self.llm, self.json_llm, all_tools,
             self.vector_db, self.bm25_instance, self.bm25_corpus, self.reranker,
             state_store=self.state_store,
+            tool_metadata_by_name=self.tool_metadata_by_name,
+            capability_hints=self.tool_capability_hints,
         )
         print("🤖[Agentic] 专家模式工作流引擎初始化完毕")
 

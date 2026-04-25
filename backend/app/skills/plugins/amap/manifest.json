@@ -1,0 +1,44 @@
+{
+  "name": "amap_skill_plugin",
+  "enabled": true,
+  "factory": "app.skills.amap_skills:create_amap_tools",
+  "capabilities": ["route_plan", "nearby_search", "weather_query"],
+  "route_hints": {
+    "route_plan": ["路线", "导航", "怎么走", "从.*到.*"],
+    "nearby_search": ["附近", "周边", "停车场", "加油站", "充电桩"],
+    "weather_query": ["天气", "降雨", "温度", "下雨", "下雪"]
+  },
+  "policy": {
+    "timeout_s": 12,
+    "retries": 1
+  },
+  "tools": [
+    {
+      "name": "expert_get_route",
+      "capabilities": ["route_plan"],
+      "planner_enabled": true,
+      "policy": {"timeout_s": 12, "retries": 1},
+      "route_hints": ["路线", "导航", "怎么走", "从.*到.*"]
+    },
+    {
+      "name": "expert_search_nearby",
+      "capabilities": ["nearby_search"],
+      "planner_enabled": true,
+      "policy": {"timeout_s": 12, "retries": 1},
+      "route_hints": ["附近", "周边", "停车场", "加油站", "充电桩"]
+    },
+    {
+      "name": "expert_get_weather",
+      "capabilities": ["weather_query"],
+      "planner_enabled": true,
+      "policy": {"timeout_s": 10, "retries": 1},
+      "route_hints": ["天气", "降雨", "温度", "下雨", "下雪"]
+    }
+  ],
+  "tool_names": [
+    "expert_get_route",
+    "expert_search_nearby",
+    "expert_get_weather"
+  ],
+  "description": "高德地图工具集（路线、周边、天气）"
+}

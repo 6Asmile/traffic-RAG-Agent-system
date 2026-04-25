@@ -1,0 +1,22 @@
+{
+  "entry_point": "bootstrap_node",
+  "nodes": {
+    "bootstrap_node": { "enabled": true },
+    "router_agent_node": { "enabled": true },
+    "law_agent_node": { "enabled": true },
+    "tool_agent_node": { "enabled": true },
+    "synth_agent_node": { "enabled": true },
+    "judge_agent_node": { "enabled": true }
+  },
+  "conditional_edges": [
+    { "from": "bootstrap_node", "type": "resume_router" }
+  ],
+  "edges": [
+    { "from": "router_agent_node", "to": "law_agent_node" },
+    { "from": "router_agent_node", "to": "tool_agent_node" },
+    { "from": "law_agent_node", "to": "synth_agent_node" },
+    { "from": "tool_agent_node", "to": "synth_agent_node" },
+    { "from": "synth_agent_node", "to": "judge_agent_node" },
+    { "from": "judge_agent_node", "to": "__end__" }
+  ]
+}

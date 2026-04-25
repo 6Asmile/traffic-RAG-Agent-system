@@ -24,17 +24,15 @@ class AgentStateStore:
 
     CHECKPOINT_TTL_SECONDS = 86400 * 7
     MEMORY_TTL_SECONDS = 86400 * 30
-    MEMORY_MAX_ITEMS = 80
-    TIMELINE_MAX_ITEMS = 200
-    DB_TABLES_READY = False
-    DB_STATE_JSON_MAX_BYTES = 48 * 1024
-    MSG_MAX_ITEMS = 12
-    HISTORY_MSG_MAX_ITEMS = 10
-    DOC_MAX_ITEMS = 8
-    SOURCE_MAX_ITEMS = 8
-    TOOL_CTX_MAX_ITEMS = 8
-    MEMORY_CTX_MAX_ITEMS = 6
-    INTERMEDIATE_MAX_ITEMS = 20
+    MEMORY_MAX_ITEMS = 80  # 每个用户最多存80条记忆
+    TIMELINE_MAX_ITEMS = 200  # 每轮对话最多记录200步轨迹
+    MSG_MAX_ITEMS = 12  # 最多保留12条消息
+    HISTORY_MSG_MAX_ITEMS = 10  # 历史消息最多10条
+    DOC_MAX_ITEMS = 8  # 最多带8篇文档
+    SOURCE_MAX_ITEMS = 8  # 最多8个引用来源
+    TOOL_CTX_MAX_ITEMS = 8  # 最多8条工具上下文
+    MEMORY_CTX_MAX_ITEMS = 6  # 最多召回6条记忆
+    INTERMEDIATE_MAX_ITEMS = 20  # 中间步骤最多20条
 
     def __init__(self, redis_client=None, db: Optional[Session] = None):
         self.redis_client = redis_client

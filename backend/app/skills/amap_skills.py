@@ -53,4 +53,4 @@ def create_amap_tools():
         args_schema=WeatherInput,
     )
 
-    return[route_tool, nearby_tool, weather_tool]
+    return [route_tool, nearby_tool, weather_tool]

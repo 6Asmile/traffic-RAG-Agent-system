@@ -1,0 +1,31 @@
+{
+  "name": "law_skill_plugin",
+  "enabled": true,
+  "factory": "app.skills.law_skills:create_law_search_tool",
+  "capabilities": [
+    "law_search",
+    "hybrid_retrieval"
+  ],
+  "route_hints": {
+    "law_search": ["法规", "法条", "处罚", "罚款", "扣分", "事故责任", "违章", "违法"]
+  },
+  "policy": {
+    "timeout_s": 15,
+    "retries": 1
+  },
+  "tools": [
+    {
+      "name": "search_traffic_law_database",
+      "capabilities": ["law_search"],
+      "planner_enabled": false,
+      "policy": {
+        "timeout_s": 15,
+        "retries": 1
+      }
+    }
+  ],
+  "tool_names": [
+    "search_traffic_law_database"
+  ],
+  "description": "交通法规混合检索工具（FAISS+BM25+Rerank）"
+}

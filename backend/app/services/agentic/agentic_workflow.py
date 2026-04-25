@@ -3,9 +3,10 @@
 import asyncio
 import json
 import logging
+import os
 import re
 import time
-from typing import Literal
+from typing import Any, Literal
 
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 from langgraph.graph import END, StateGraph
@@ -42,18 +43,27 @@ class AgenticWorkflowManager:
         bm25_corpus,
         reranker,
         state_store: AgentStateStore | None = None,
+        tool_metadata_by_name: dict[str, dict[str, Any]] | None = None,
+        capability_hints: dict[str, list[str]] | None = None,
+        workflow_manifest_path: str | None = None,
     ):
         self.llm = llm
         self.json_llm = json_llm
         self.state_store = state_store
 
         self.tools = {t.name: t for t in tools_list}
-        self.law_tool = self.tools.get(AgentToolNames.LAW_SEARCH)
-        self.external_tool_names = [
-            AgentToolNames.MAP_ROUTE,
-            AgentToolNames.MAP_NEARBY,
-            AgentToolNames.MAP_WEATHER,
-        ]
+        self.tool_metadata_by_name = dict(tool_metadata_by_name or {})
+        self.capability_hints = dict(capability_hints or {})
+        self.workflow_manifest_path = workflow_manifest_path or os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "..", "..", "core", "agentic", "workflow_manifest.json")
+        )
+        self.enabled_nodes: set[str] = set()
+
+        self.available_capabilities = self._collect_available_capabilities()
+        self.law_tool_names = self._find_law_tool_names()
+        self.law_tool_name = self.law_tool_names[0] if self.law_tool_names else ""
+        self.law_tool = self.tools.get(self.law_tool_name) if self.law_tool_name else None
+        self.external_tool_names = self._find_planner_enabled_tool_names()
         self.external_tools = [self.tools[name] for name in self.external_tool_names if name in self.tools]
         self.tool_llm = self.llm.bind_tools(self.external_tools) if self.external_tools else None
         self.agent_policies = {
@@ -74,6 +84,7 @@ class AgenticWorkflowManager:
         self.bm25_corpus = bm25_corpus
         self.reranker = reranker
 
+        RouterAgentSubgraph.configure_capability_patterns(self.capability_hints)
         self.graph = self._build_graph()
 
     @staticmethod
@@ -137,8 +148,10 @@ class AgenticWorkflowManager:
             failures = 0
         self.agent_breakers[agent_key] = {"failures": failures, "opened_until": opened_until}
 
-    async def _run_guarded(self, agent_key: str, op_name: str, coro_factory):
-        policy = self.agent_policies.get(agent_key, {})
+    async def _run_guarded(self, agent_key: str, op_name: str, coro_factory, policy_override: dict | None = None):
+        policy = dict(self.agent_policies.get(agent_key, {}))
+        if isinstance(policy_override, dict):
+            policy.update(policy_override)
         timeout_s = int(policy.get("timeout_s", 10))
         retries = int(policy.get("retries", 0))
         metrics = {
@@ -205,40 +218,174 @@ class AgenticWorkflowManager:
         except json.JSONDecodeError:
             return default
 
-    def _build_tool_plan(self, planner_output: str) -> list[dict]:
+    def _get_tool_meta(self, tool_name: str) -> dict[str, Any]:
+        return self.tool_metadata_by_name.get(str(tool_name or "").strip(), {}) or {}
+
+    def _get_tool_capabilities(self, tool_name: str) -> list[str]:
+        meta = self._get_tool_meta(tool_name)
+        caps = meta.get("capabilities", [])
+        if isinstance(caps, list):
+            return [str(item).strip() for item in caps if str(item).strip()]
+        return []
+
+    def _get_tool_policy(self, tool_name: str) -> dict[str, Any]:
+        meta = self._get_tool_meta(tool_name)
+        policy = meta.get("policy", {})
+        return policy if isinstance(policy, dict) else {}
+
+    def _collect_available_capabilities(self) -> set[str]:
+        caps: set[str] = set()
+        for tool_name in self.tools:
+            tool_caps = self._get_tool_capabilities(tool_name)
+            for cap in tool_caps:
+                normalized = str(cap).strip()
+                if normalized:
+                    caps.add(normalized)
+        return caps
+
+    def _find_law_tool_names(self) -> list[str]:
+        names = []
+        for tool_name in self.tools:
+            if "law_search" in self._get_tool_capabilities(tool_name):
+                names.append(tool_name)
+        if not names and AgentToolNames.LAW_SEARCH in self.tools:
+            names.append(AgentToolNames.LAW_SEARCH)
+        return names
+
+    def _find_planner_enabled_tool_names(self) -> list[str]:
+        planner_tools = []
+        for tool_name in self.tools:
+            if tool_name in self.law_tool_names:
+                continue
+            meta = self._get_tool_meta(tool_name)
+            if bool(meta.get("planner_enabled", True)):
+                planner_tools.append(tool_name)
+        return planner_tools
+
+    def _resolve_tool_names_by_capabilities(
+        self,
+        capabilities: list[str],
+        candidate_pool: list[str] | None = None,
+    ) -> list[str]:
+        pool = [name for name in (candidate_pool or self.external_tool_names) if name in self.tools]
+        normalized_caps = [str(cap).strip() for cap in (capabilities or []) if str(cap).strip()]
+        if not normalized_caps:
+            return list(pool)
+
+        resolved = []
+        seen = set()
+        for tool_name in pool:
+            tool_caps = set(self._get_tool_capabilities(tool_name))
+            if not tool_caps:
+                continue
+            if any(cap in tool_caps for cap in normalized_caps):
+                if tool_name not in seen:
+                    seen.add(tool_name)
+                    resolved.append(tool_name)
+        return resolved
+
+    def _normalize_router_handoff(self, handoff: dict[str, Any]) -> dict[str, Any]:
+        raw_caps = handoff.get("need_capabilities", [])
+        caps = [str(cap).strip() for cap in (raw_caps or []) if str(cap).strip()]
+        filtered_caps = [cap for cap in caps if cap in self.available_capabilities]
+
+        need_law = "law_search" in filtered_caps
+        need_tool = any(cap != "law_search" for cap in filtered_caps)
+        if need_law and need_tool:
+            task_type = "hybrid"
+        elif need_law:
+            task_type = "law_only"
+        elif need_tool:
+            task_type = "tool_only"
+        else:
+            task_type = "chat"
+
+        reason_codes = [
+            str(code).strip()
+            for code in (handoff.get("reason_codes", []) or [])
+            if str(code).strip()
+        ]
+        if not reason_codes and not filtered_caps:
+            reason_codes = ["fallback_chat"]
+
+        normalized = dict(handoff or {})
+        normalized.update(
+            {
+                "need_capabilities": filtered_caps,
+                "need_law": need_law,
+                "need_tool": need_tool,
+                "task_type": task_type,
+                "reason_codes": reason_codes,
+            }
+        )
+        return normalized
+
+    def _build_tool_planner_prompt(self, query: str, tool_names: list[str]) -> str:
+        catalog_lines = []
+        for tool_name in tool_names:
+            tool = self.tools.get(tool_name)
+            if tool is None:
+                continue
+            meta = self._get_tool_meta(tool_name)
+            desc = str(meta.get("description") or getattr(tool, "description", "") or "").strip()
+            capabilities = ",".join(self._get_tool_capabilities(tool_name))
+            input_schema = meta.get("input_schema", {})
+            schema_json = json.dumps(input_schema, ensure_ascii=False) if isinstance(input_schema, dict) else "{}"
+            catalog_lines.append(
+                f"- tool={tool_name} | capabilities={capabilities or 'unknown'} | description={desc or '无'} | "
+                f"input_schema={schema_json}"
+            )
+
+        catalog_text = "\n".join(catalog_lines) if catalog_lines else "- 无可用工具"
+        allowed_names = ", ".join(tool_names) if tool_names else "无"
+        return (
+            "你是 tool_agent 参数规划器。"
+            "请根据用户问题返回严格 JSON："
+            '{"tasks":[{"tool":"工具名","args":{"参数名":"参数值"}}],"notes":["可选说明"]}。'
+            "只允许使用白名单工具，禁止输出白名单外工具。"
+            "当问题不需要外部工具时，tasks 返回空数组。"
+            f"\n可用工具白名单: {allowed_names}"
+            f"\n工具目录:\n{catalog_text}"
+            f"\n用户问题: {query}"
+        )
+
+    def _validate_tool_args(self, tool_name: str, args: dict[str, Any]) -> dict[str, Any] | None:
+        tool = self.tools.get(tool_name)
+        if tool is None:
+            return None
+        raw_args = args if isinstance(args, dict) else {}
+        args_schema = getattr(tool, "args_schema", None)
+        if args_schema is None:
+            return raw_args
+        try:
+            payload = args_schema(**raw_args)
+            dump_fn = getattr(payload, "model_dump", None)
+            if callable(dump_fn):
+                return dump_fn()
+            return raw_args
+        except Exception:
+            return None
+
+    def _build_tool_plan(self, planner_output: str, allowed_tool_names: list[str]) -> list[dict]:
         payload = self._extract_json_object(planner_output, default={})
         tasks = payload.get("tasks", [])
         if not isinstance(tasks, list):
             return []
 
+        allowed = set([str(name).strip() for name in (allowed_tool_names or []) if str(name).strip()])
         normalized_tasks = []
         for item in tasks:
             if not isinstance(item, dict):
                 continue
             tool_name = str(item.get("tool") or "").strip()
+            if not tool_name or (allowed and tool_name not in allowed):
+                continue
             args = item.get("args") if isinstance(item.get("args"), dict) else {}
-            if tool_name == AgentToolNames.MAP_ROUTE:
-                origin = str(args.get("origin_name") or "").strip()
-                dest = str(args.get("destination_name") or "").strip()
-                mode = str(args.get("mode") or "driving").strip().lower()
-                if not origin or not dest:
-                    continue
-                if mode not in {"driving", "transit", "walking"}:
-                    mode = "driving"
-                normalized_tasks.append(
-                    {"tool": tool_name, "args": {"origin_name": origin, "destination_name": dest, "mode": mode}}
-                )
-            elif tool_name == AgentToolNames.MAP_NEARBY:
-                keyword = str(args.get("keyword") or "").strip()
-                city = str(args.get("city") or "全国").strip() or "全国"
-                if not keyword:
-                    continue
-                normalized_tasks.append({"tool": tool_name, "args": {"keyword": keyword, "city": city}})
-            elif tool_name == AgentToolNames.MAP_WEATHER:
-                city_name = str(args.get("city_name") or "").strip()
-                if not city_name:
-                    continue
-                normalized_tasks.append({"tool": tool_name, "args": {"city_name": city_name}})
+            validated_args = self._validate_tool_args(tool_name, args)
+            if validated_args is None:
+                continue
+            normalized_tasks.append({"tool": tool_name, "args": validated_args})
+
         return normalized_tasks
 
     def _normalize_tool_result(self, raw_result) -> str:
@@ -380,12 +527,14 @@ class AgenticWorkflowManager:
             query=original_query,
             rewritten_query=rewritten_query,
         )
+        handoff_router = self._normalize_router_handoff(handoff_router)
         updates = {
             "search_query": handoff_router["rewritten_query"],
             "handoff_router": handoff_router,
             "router_scratchpad": {
                 "history_chars": len(history_context),
                 "task_type": handoff_router["task_type"],
+                "need_capabilities": handoff_router.get("need_capabilities", []),
                 "metrics": router_metrics,
             },
             "intermediate_steps": [UIEventTypes.ROUTING],
@@ -400,8 +549,14 @@ class AgenticWorkflowManager:
     async def node_law_agent(self, state: AgenticState):
         self._save_node_checkpoint(state, NodeNames.LAW_AGENT, phase="start")
         handoff_router = state.get("handoff_router", {}) or {}
-        need_law = bool(handoff_router.get("need_law"))
+        router_caps = [
+            str(cap).strip()
+            for cap in (handoff_router.get("need_capabilities", []) or [])
+            if str(cap).strip()
+        ]
+        need_law = bool(handoff_router.get("need_law")) or ("law_search" in router_caps)
         query = str(state.get("search_query") or state.get("original_query") or "").strip()
+        law_candidate_tools = self._resolve_tool_names_by_capabilities(["law_search"], candidate_pool=self.law_tool_names)
 
         if not need_law or not query:
             updates = {
@@ -420,13 +575,14 @@ class AgenticWorkflowManager:
             )
             return updates
 
-        if self.law_tool is None:
+        if not law_candidate_tools:
             updates = {
                 "handoff_law": LawAgentSubgraph.build_handoff([], [], confidence=0.0),
                 "law_scratchpad": {
                     "skipped": True,
                     "reason": "law_tool_missing",
                     "metrics": {"agent": "law", "operation": "law_search", "skipped": True},
+                    "candidate_tools": law_candidate_tools,
                 },
                 "intermediate_steps": [UIEventTypes.LAW_WORKING],
             }
@@ -441,11 +597,17 @@ class AgenticWorkflowManager:
         law_sources: list[dict] = list(state.get("public_sources", []))
         memory_contexts = list(state.get("private_memory_contexts", []))
         try:
+            selected_law_tool = law_candidate_tools[0]
+            law_tool_obj = self.tools[selected_law_tool]
+            law_policy = self._get_tool_policy(selected_law_tool)
             raw_result, law_metrics, law_err = await self._run_guarded(
                 "law",
-                "law_search",
-                lambda: self.law_tool.ainvoke({"query": query}),
+                f"law_search_{selected_law_tool}",
+                lambda: law_tool_obj.ainvoke({"query": query}),
+                policy_override=law_policy,
             )
+            law_metrics["policy"] = law_policy
+            law_metrics["selected_tool"] = selected_law_tool
             if raw_result is None and law_err:
                 raise RuntimeError(law_err)
             extracted_sources = self._extract_law_sources(raw_result)
@@ -473,6 +635,7 @@ class AgenticWorkflowManager:
                 "handoff_law": handoff_law,
                 "law_scratchpad": {
                     "query": query,
+                    "candidate_tools": law_candidate_tools,
                     "law_doc_count": len(law_docs),
                     "law_source_count": len(law_sources),
                     "memory_count": len(memory_contexts),
@@ -512,16 +675,31 @@ class AgenticWorkflowManager:
     async def node_tool_agent(self, state: AgenticState):
         self._save_node_checkpoint(state, NodeNames.TOOL_AGENT, phase="start")
         handoff_router = state.get("handoff_router", {}) or {}
-        need_tool = bool(handoff_router.get("need_tool"))
+        router_caps = [
+            str(cap).strip()
+            for cap in (handoff_router.get("need_capabilities", []) or [])
+            if str(cap).strip()
+        ]
+        requested_capabilities = [cap for cap in router_caps if cap != "law_search"]
+        need_tool = bool(handoff_router.get("need_tool")) or bool(requested_capabilities)
         query = str(state.get("search_query") or state.get("original_query") or "").strip()
+        candidate_tool_names = self._resolve_tool_names_by_capabilities(requested_capabilities)
+        if need_tool and not candidate_tool_names:
+            candidate_tool_names = list(self.external_tool_names)
 
-        if not need_tool or not query:
+        if not need_tool or not query or not candidate_tool_names:
+            skip_reason = "need_tool_false"
+            if need_tool and not query:
+                skip_reason = "empty_query"
+            elif need_tool and not candidate_tool_names:
+                skip_reason = "no_candidate_tools"
             updates = {
                 "handoff_tool": ToolAgentSubgraph.build_handoff([], [], widget_count=0),
                 "tool_scratchpad": {
                     "skipped": True,
-                    "reason": "need_tool_false",
+                    "reason": skip_reason,
                     "metrics": {"agent": "tool", "operation": "planning", "skipped": True},
+                    "requested_capabilities": requested_capabilities,
                 },
                 "intermediate_steps": [UIEventTypes.TOOL_WORKING],
             }
@@ -540,33 +718,25 @@ class AgenticWorkflowManager:
         planned_tasks: list[dict] = []
 
         try:
-            planner_prompt = (
-                "你是 tool_agent 参数规划器。"
-                "请根据用户问题生成可执行工具计划，输出严格JSON。"
-                "只允许以下 tool："
-                f"{AgentToolNames.MAP_ROUTE}, {AgentToolNames.MAP_NEARBY}, {AgentToolNames.MAP_WEATHER}。"
-                "JSON格式："
-                '{"tasks":[{"tool":"expert_get_route","args":{"origin_name":"",'
-                '"destination_name":"","mode":"driving|transit|walking"}},'
-                '{"tool":"expert_search_nearby","args":{"keyword":"","city":"全国"}},'
-                '{"tool":"expert_get_weather","args":{"city_name":""}}],'
-                '"notes":["..."]}'
-                "无合适工具时 tasks 返回空数组。"
-                f"\n用户问题：{query}"
-            )
+            planner_prompt = self._build_tool_planner_prompt(query, candidate_tool_names)
             planner_result, planner_metrics, planner_err = await self._run_guarded(
                 "tool",
                 "json_planning",
                 lambda: self.json_llm.ainvoke(planner_prompt),
             )
             planner_text = str(getattr(planner_result, "content", "") or "")
-            planned_tasks = self._build_tool_plan(planner_text) if not planner_err else []
-            if not planned_tasks and self.tool_llm:
+            planned_tasks = (
+                self._build_tool_plan(planner_text, candidate_tool_names)
+                if not planner_err else []
+            )
+            if not planned_tasks and candidate_tool_names:
                 # 规划失败时降级到工具调用模型，保持可用性
+                fallback_tools = [self.tools[name] for name in candidate_tool_names if name in self.tools]
+                fallback_llm = self.llm.bind_tools(fallback_tools) if fallback_tools else self.tool_llm
                 fallback_resp, fallback_metrics, _ = await self._run_guarded(
                     "tool",
                     "fallback_tool_call",
-                    lambda: self.tool_llm.ainvoke(
+                    lambda: fallback_llm.ainvoke(
                         [
                             SystemMessage(content="你是tool_agent。仅调用外部工具，不回答法规。"),
                             HumanMessage(content=query),
@@ -583,21 +753,31 @@ class AgenticWorkflowManager:
                         }
                     )
                 # fallback 任务也需要做字段规范化
-                normalized_fallback = self._build_tool_plan(json.dumps({"tasks": planned_tasks}, ensure_ascii=False))
+                normalized_fallback = self._build_tool_plan(
+                    json.dumps({"tasks": planned_tasks}, ensure_ascii=False),
+                    candidate_tool_names,
+                )
                 planned_tasks = normalized_fallback
 
             for idx, task in enumerate(planned_tasks):
                 tool_name = str(task.get("tool") or "").strip()
                 tool_args = task.get("args", {}) if isinstance(task.get("args"), dict) else {}
-                if tool_name not in self.tools or tool_name == AgentToolNames.LAW_SEARCH:
+                if (
+                    tool_name not in self.tools
+                    or tool_name == self.law_tool_name
+                    or tool_name not in candidate_tool_names
+                ):
                     continue
                 tool_names.append(tool_name)
+                tool_policy = self._get_tool_policy(tool_name)
 
                 result, invoke_metrics, invoke_err = await self._run_guarded(
                     "tool",
                     f"invoke_{tool_name}",
                     lambda n=tool_name, a=tool_args: self.tools[n].ainvoke(a),
+                    policy_override=tool_policy,
                 )
+                invoke_metrics["policy"] = tool_policy
                 execution_metrics.append(invoke_metrics)
                 if result is not None and not invoke_err:
                     normalized = self._normalize_tool_result(result)
@@ -624,6 +804,8 @@ class AgenticWorkflowManager:
                 "handoff_tool": handoff_tool,
                 "tool_scratchpad": {
                     "query": query,
+                    "requested_capabilities": requested_capabilities,
+                    "candidate_tool_names": candidate_tool_names,
                     "planned_tasks": planned_tasks,
                     "tool_count": len(tool_names),
                     "tool_context_count": len(tool_contexts),
@@ -726,7 +908,12 @@ class AgenticWorkflowManager:
     async def node_judge_agent(self, state: AgenticState):
         self._save_node_checkpoint(state, NodeNames.JUDGE_AGENT, phase="start")
         handoff_router = state.get("handoff_router", {}) or {}
-        need_law = bool(handoff_router.get("need_law"))
+        router_caps = [
+            str(cap).strip()
+            for cap in (handoff_router.get("need_capabilities", []) or [])
+            if str(cap).strip()
+        ]
+        need_law = (bool(handoff_router.get("need_law")) or ("law_search" in router_caps)) and bool(self.law_tool_names)
         documents = state.get("private_documents", [])
         law_sources = state.get("public_sources", [])
         generation = state.get("generation", "")
@@ -794,6 +981,62 @@ class AgenticWorkflowManager:
         )
         return updates
 
+    @staticmethod
+    def _default_workflow_manifest() -> dict[str, Any]:
+        return {
+            "entry_point": NodeNames.BOOTSTRAP,
+            "nodes": {
+                NodeNames.BOOTSTRAP: {"enabled": True},
+                NodeNames.ROUTER_AGENT: {"enabled": True},
+                NodeNames.LAW_AGENT: {"enabled": True},
+                NodeNames.TOOL_AGENT: {"enabled": True},
+                NodeNames.SYNTH_AGENT: {"enabled": True},
+                NodeNames.JUDGE_AGENT: {"enabled": True},
+            },
+            "conditional_edges": [
+                {"from": NodeNames.BOOTSTRAP, "type": "resume_router"},
+            ],
+            "edges": [
+                {"from": NodeNames.ROUTER_AGENT, "to": NodeNames.LAW_AGENT},
+                {"from": NodeNames.ROUTER_AGENT, "to": NodeNames.TOOL_AGENT},
+                {"from": NodeNames.LAW_AGENT, "to": NodeNames.SYNTH_AGENT},
+                {"from": NodeNames.TOOL_AGENT, "to": NodeNames.SYNTH_AGENT},
+                {"from": NodeNames.SYNTH_AGENT, "to": NodeNames.JUDGE_AGENT},
+                {"from": NodeNames.JUDGE_AGENT, "to": "__end__"},
+            ],
+        }
+
+    def _load_workflow_manifest(self) -> dict[str, Any]:
+        default_manifest = self._default_workflow_manifest()
+        path = str(self.workflow_manifest_path or "").strip()
+        if not path or not os.path.isfile(path):
+            return default_manifest
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            if not isinstance(payload, dict):
+                return default_manifest
+            merged = dict(default_manifest)
+            if isinstance(payload.get("entry_point"), str):
+                merged["entry_point"] = payload["entry_point"]
+            if isinstance(payload.get("nodes"), dict):
+                nodes = dict(default_manifest.get("nodes", {}))
+                for node_name, cfg in payload.get("nodes", {}).items():
+                    if not isinstance(cfg, dict):
+                        continue
+                    current = dict(nodes.get(node_name, {}))
+                    current.update(cfg)
+                    nodes[node_name] = current
+                merged["nodes"] = nodes
+            if isinstance(payload.get("conditional_edges"), list):
+                merged["conditional_edges"] = payload.get("conditional_edges", [])
+            if isinstance(payload.get("edges"), list):
+                merged["edges"] = payload.get("edges", [])
+            return merged
+        except Exception as e:
+            logger.warning(f"workflow manifest 读取失败，回退默认配置: {e}")
+            return default_manifest
+
     def route_from_bootstrap(
         self, state: AgenticState
     ) -> Literal[
@@ -804,13 +1047,24 @@ class AgenticWorkflowManager:
         NodeNames.JUDGE_AGENT,
     ]:
         resume_from = str(state.get("resume_from_node", "") or "").strip()
-        allowed = {
+        allowed = set(self.enabled_nodes) or {
             NodeNames.ROUTER_AGENT,
             NodeNames.LAW_AGENT,
             NodeNames.TOOL_AGENT,
             NodeNames.SYNTH_AGENT,
             NodeNames.JUDGE_AGENT,
         }
+        allowed.discard(NodeNames.BOOTSTRAP)
+        def _fallback_node() -> str:
+            if NodeNames.ROUTER_AGENT in allowed:
+                return NodeNames.ROUTER_AGENT
+            if NodeNames.TOOL_AGENT in allowed:
+                return NodeNames.TOOL_AGENT
+            if NodeNames.LAW_AGENT in allowed:
+                return NodeNames.LAW_AGENT
+            if NodeNames.SYNTH_AGENT in allowed:
+                return NodeNames.SYNTH_AGENT
+            return NodeNames.JUDGE_AGENT
         legacy_map = {
             NodeNames.AGENT: NodeNames.ROUTER_AGENT,
             NodeNames.ACTION: NodeNames.TOOL_AGENT,
@@ -825,33 +1079,84 @@ class AgenticWorkflowManager:
             return resume_from  # type: ignore[return-value]
         if resume_from in legacy_map:
             mapped = legacy_map[resume_from]
+            if mapped not in allowed:
+                return _fallback_node()  # type: ignore[return-value]
             logger.warning(f"[恢复执行] 旧节点 {resume_from} 映射到新节点 {mapped}")
             return mapped  # type: ignore[return-value]
-        return NodeNames.ROUTER_AGENT
+        return _fallback_node()  # type: ignore[return-value]
 
     def _build_graph(self) -> StateGraph:
         workflow = StateGraph(AgenticState)
+        manifest = self._load_workflow_manifest()
+        node_handlers = {
+            NodeNames.BOOTSTRAP: self.node_bootstrap,
+            NodeNames.ROUTER_AGENT: self.node_router_agent,
+            NodeNames.LAW_AGENT: self.node_law_agent,
+            NodeNames.TOOL_AGENT: self.node_tool_agent,
+            NodeNames.SYNTH_AGENT: self.node_synth_agent,
+            NodeNames.JUDGE_AGENT: self.node_judge_agent,
+        }
 
-        workflow.add_node(NodeNames.BOOTSTRAP, self.node_bootstrap)
-        workflow.add_node(NodeNames.ROUTER_AGENT, self.node_router_agent)
-        workflow.add_node(NodeNames.LAW_AGENT, self.node_law_agent)
-        workflow.add_node(NodeNames.TOOL_AGENT, self.node_tool_agent)
-        workflow.add_node(NodeNames.SYNTH_AGENT, self.node_synth_agent)
-        workflow.add_node(NodeNames.JUDGE_AGENT, self.node_judge_agent)
+        nodes_cfg = manifest.get("nodes", {}) if isinstance(manifest.get("nodes"), dict) else {}
+        enabled_nodes = []
+        for node_name, handler in node_handlers.items():
+            cfg = nodes_cfg.get(node_name, {}) if isinstance(nodes_cfg, dict) else {}
+            enabled = bool(cfg.get("enabled", True)) if isinstance(cfg, dict) else True
+            if enabled:
+                workflow.add_node(node_name, handler)
+                enabled_nodes.append(node_name)
+        self.enabled_nodes = set(enabled_nodes)
+        if not enabled_nodes:
+            workflow.add_node(NodeNames.BOOTSTRAP, self.node_bootstrap)
+            workflow.add_node(NodeNames.ROUTER_AGENT, self.node_router_agent)
+            workflow.add_node(NodeNames.SYNTH_AGENT, self.node_synth_agent)
+            workflow.add_node(NodeNames.JUDGE_AGENT, self.node_judge_agent)
+            enabled_nodes = [NodeNames.BOOTSTRAP, NodeNames.ROUTER_AGENT, NodeNames.SYNTH_AGENT, NodeNames.JUDGE_AGENT]
+            self.enabled_nodes = set(enabled_nodes)
 
-        workflow.set_entry_point(NodeNames.BOOTSTRAP)
-        workflow.add_conditional_edges(NodeNames.BOOTSTRAP, self.route_from_bootstrap)
+        entry_point = str(manifest.get("entry_point") or NodeNames.BOOTSTRAP).strip()
+        if entry_point not in self.enabled_nodes:
+            entry_point = NodeNames.BOOTSTRAP if NodeNames.BOOTSTRAP in self.enabled_nodes else enabled_nodes[0]
+        workflow.set_entry_point(entry_point)
 
-        # router 分配后，law/tool 并行执行（不需要的分支自行 no-op）
-        workflow.add_edge(NodeNames.ROUTER_AGENT, NodeNames.LAW_AGENT)
-        workflow.add_edge(NodeNames.ROUTER_AGENT, NodeNames.TOOL_AGENT)
+        conditional_edges = manifest.get("conditional_edges", [])
+        conditional_added = False
+        if isinstance(conditional_edges, list):
+            for item in conditional_edges:
+                if not isinstance(item, dict):
+                    continue
+                src = str(item.get("from") or "").strip()
+                edge_type = str(item.get("type") or "").strip()
+                if src == NodeNames.BOOTSTRAP and edge_type == "resume_router" and src in self.enabled_nodes:
+                    workflow.add_conditional_edges(NodeNames.BOOTSTRAP, self.route_from_bootstrap)
+                    conditional_added = True
+        if (
+            not conditional_added
+            and NodeNames.BOOTSTRAP in self.enabled_nodes
+            and NodeNames.ROUTER_AGENT in self.enabled_nodes
+        ):
+            workflow.add_conditional_edges(NodeNames.BOOTSTRAP, self.route_from_bootstrap)
 
-        # synth 汇总两个分支
-        workflow.add_edge(NodeNames.LAW_AGENT, NodeNames.SYNTH_AGENT)
-        workflow.add_edge(NodeNames.TOOL_AGENT, NodeNames.SYNTH_AGENT)
-
-        # judge 最终把关
-        workflow.add_edge(NodeNames.SYNTH_AGENT, NodeNames.JUDGE_AGENT)
-        workflow.add_edge(NodeNames.JUDGE_AGENT, END)
+        edges = manifest.get("edges", [])
+        seen_edges = set()
+        if isinstance(edges, list):
+            for item in edges:
+                if not isinstance(item, dict):
+                    continue
+                src = str(item.get("from") or "").strip()
+                dst = str(item.get("to") or "").strip()
+                if not src or not dst:
+                    continue
+                edge_key = f"{src}->{dst}"
+                if edge_key in seen_edges:
+                    continue
+                seen_edges.add(edge_key)
+                if src not in self.enabled_nodes:
+                    continue
+                if dst == "__end__":
+                    workflow.add_edge(src, END)
+                    continue
+                if dst in self.enabled_nodes:
+                    workflow.add_edge(src, dst)
 
         return workflow.compile()
