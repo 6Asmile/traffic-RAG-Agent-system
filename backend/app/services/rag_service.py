@@ -13,7 +13,6 @@ import httpx
 import jieba
 
 from langchain_community.vectorstores import FAISS
-from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 from langchain_core.messages import HumanMessage, ToolMessage, AIMessage, SystemMessage
 from langchain_openai import ChatOpenAI
@@ -42,6 +41,11 @@ from app.services.chat_history_utils import (
     render_history_context,
 )
 from app.services.config_service import ConfigService
+from app.services.hybrid_search import (
+    HybridRetrievalConfig,
+    parallel_hybrid_retrieve,
+    rerank_with_dynamic_threshold,
+)
 from app.services.tool_service import agent_get_route, agent_search_nearby, agent_get_weather
 
 os.environ["ANONYMIZED_TELEMETRY"] = "False"
@@ -229,6 +233,64 @@ class RAGService:
                 logger.warning("BM25 初始化为空，知识库没有可用文本")
         except Exception as e:
             logger.error(f"BM25 初始化失败: {e}")
+
+    def _build_hybrid_config(self, mode: str = "fast") -> HybridRetrievalConfig:
+        normalized_mode = str(mode or "fast").strip().lower()
+        if normalized_mode == "expert":
+            return HybridRetrievalConfig(
+                faiss_top_k=60,
+                bm25_top_n=40,
+                fusion_top_n=80,
+                rerank_top_n=15,
+                rrf_k=60,
+                weight_faiss=0.6,
+                weight_bm25=0.4,
+                score_threshold=0.12,
+                dynamic_margin=0.18,
+                min_keep=5,
+            )
+        return HybridRetrievalConfig(
+            faiss_top_k=AIModelConstants.FAST_FAISS_TOP_K,
+            bm25_top_n=AIModelConstants.FAST_BM25_TOP_N,
+            fusion_top_n=AIModelConstants.FAST_FUSION_TOP_N,
+            rerank_top_n=AIModelConstants.FAST_RERANK_TOP_N,
+            rrf_k=AIModelConstants.FAST_RRF_K,
+            weight_faiss=AIModelConstants.FAST_RRF_WEIGHT_FAISS,
+            weight_bm25=AIModelConstants.FAST_RRF_WEIGHT_BM25,
+            score_threshold=AIModelConstants.DEFAULT_SCORE_THRESHOLD,
+            dynamic_margin=AIModelConstants.FAST_DYNAMIC_MARGIN,
+            min_keep=AIModelConstants.FAST_MIN_KEEP,
+        )
+
+    async def retrieve_hybrid_docs(self, search_query: str, mode: str = "fast") -> dict:
+        config = self._build_hybrid_config(mode=mode)
+        retrieval = await parallel_hybrid_retrieve(
+            query=search_query,
+            vector_db=self.vector_db,
+            bm25_instance=self.bm25_instance,
+            bm25_corpus=self.bm25_corpus,
+            config=config,
+        )
+
+        candidate_list = retrieval.get("fused_docs", [])
+        rerank = rerank_with_dynamic_threshold(
+            query=search_query,
+            candidates=candidate_list,
+            reranker=self.reranker,
+            config=config,
+        )
+        return {
+            "config": config,
+            "faiss_docs": retrieval.get("faiss_docs", []),
+            "bm25_docs": retrieval.get("bm25_docs", []),
+            "fused_docs": candidate_list,
+            "fused_scores": retrieval.get("fused_scores", {}),
+            "final_docs": rerank.get("final_docs", []),
+            "rerank_scores": rerank.get("rerank_scores", []),
+            "threshold_used": float(rerank.get("threshold_used", config.score_threshold)),
+            "top_score": float(rerank.get("top_score", 0.0)),
+            "rerank_fallback": bool(rerank.get("fallback", False)),
+        }
 
     def _process_document_advanced(self, file_path: str, ext: str) -> list:
         print(f"👁️ [解析路由] 启动文档解析: {file_path} (格式: {ext})")
@@ -494,35 +556,22 @@ class RAGService:
 
         # 4. 混合检索
         print("📡 [混合检索] 执行中...")
-        faiss_docs = self.vector_db.similarity_search(search_query, k=40)
-        bm25_docs = []
-        if self.bm25_instance:
-            tokenized_query = list(jieba.cut(search_query))
-            scores = self.bm25_instance.get_scores(tokenized_query)
-            top_n = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:20]
-            bm25_docs = [Document(page_content=self.bm25_corpus[i]) for i in top_n if scores[i] > 0]
+        hybrid_result = await self.retrieve_hybrid_docs(search_query, mode="fast")
+        faiss_docs = hybrid_result.get("faiss_docs", [])
+        bm25_docs = hybrid_result.get("bm25_docs", [])
+        candidate_list = hybrid_result.get("fused_docs", [])
+        final_docs = hybrid_result.get("final_docs", [])
+        threshold_used = float(hybrid_result.get("threshold_used", AIModelConstants.DEFAULT_SCORE_THRESHOLD))
+        top_score = float(hybrid_result.get("top_score", 0.0))
+        rerank_fallback = bool(hybrid_result.get("rerank_fallback", False))
 
-        candidates = {}
-        for d in faiss_docs + bm25_docs:
-            if d.page_content not in candidates:
-                candidates[d.page_content] = d.page_content
-        candidate_list = list(candidates.values())
-
-        print(f"🎯[Rerank] 正在对 {len(candidate_list)} 个片段进行精排...")
-
-        # 5. 重排序与防幻觉截断
-        # 使用常量替换硬编码阈值
-        final_docs = []
-        try:
-            rerank_results = self.reranker.rerank(search_query, candidate_list, top_n=10)
-            for res in rerank_results:
-                score = res.get('relevance_score', -100)
-                idx = res.get('index')
-                if score < AIModelConstants.DEFAULT_SCORE_THRESHOLD: continue
-                final_docs.append(candidate_list[idx])
-        except Exception as e:
-            print(f"Rerank 异常 (降级): {e}")
-            final_docs = candidate_list[:5]
+        print(
+            f"[普通检索指标] query='{search_query[:30]}' | "
+            f"faiss={len(faiss_docs)} | bm25={len(bm25_docs)} | "
+            f"fusion={len(candidate_list)} | final={len(final_docs)} | "
+            f"threshold={threshold_used:.4f} | top_rerank={top_score:.4f} | "
+            f"rerank_fallback={rerank_fallback}"
+        )
 
         if not final_docs:
             print("❌ [防幻觉] 所有片段得分均低于阈值，判定为知识库无相关内容。")

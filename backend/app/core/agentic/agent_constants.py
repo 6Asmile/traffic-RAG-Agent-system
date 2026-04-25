@@ -73,8 +73,19 @@ class AgentToolDesc:
 
 class RAGToolConfig:
     """RAG 底层参数常量"""
-    FAISS_TOP_K = 40
-    BM25_TOP_N = 20
-    RERANK_TOP_N = 10
-    SCORE_THRESHOLD = 0.5
+    # 专家模式（Agentic）检索参数
+    FAISS_TOP_K = 60
+    BM25_TOP_N = 40
+    FUSION_TOP_N = 80
+    RERANK_TOP_N = 15
+
+    # Weighted RRF 融合参数
+    RRF_K = 60
+    RRF_WEIGHT_FAISS = 0.6
+    RRF_WEIGHT_BM25 = 0.4
+
+    # Rerank 动态阈值参数
+    SCORE_THRESHOLD = 0.12
+    DYNAMIC_MARGIN = 0.18
+    MIN_KEEP = 5
     FALLBACK_MESSAGE = "抱歉，法律知识库中未检索到相关条款，请尝试更换关键词重新检索。"

@@ -60,7 +60,18 @@ class AIModelConstants:
     COMPATIBLE_MODE_PATH = "/compatible-mode/v1"
 
     DEFAULT_RERANK_MODEL = "gte-rerank"
-    DEFAULT_SCORE_THRESHOLD = 0.05
+    DEFAULT_SCORE_THRESHOLD = 0.15
+
+    # 普通极速模式检索参数
+    FAST_FAISS_TOP_K = 20
+    FAST_BM25_TOP_N = 20
+    FAST_FUSION_TOP_N = 30
+    FAST_RERANK_TOP_N = 8
+    FAST_RRF_K = 60
+    FAST_RRF_WEIGHT_FAISS = 0.6
+    FAST_RRF_WEIGHT_BM25 = 0.4
+    FAST_DYNAMIC_MARGIN = 0.18
+    FAST_MIN_KEEP = 3
 
     # 文本切片配置
     CHUNK_SIZE = 1200
