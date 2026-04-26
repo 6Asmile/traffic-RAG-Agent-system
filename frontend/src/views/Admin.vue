@@ -1,724 +1,635 @@
 <template>
-  <div class="admin-layout-wrapper">
-    <!-- 左侧导航 -->
-    <aside class="sidebar">
-      <div class="logo">
-        <el-icon class="mr-2"><Guide /></el-icon> ITQA 控制中枢
-      </div>
-      <div class="menu-list custom-scrollbar">
-        <div v-for="(group, gIndex) in ADMIN_MENUS" :key="gIndex">
-          <div class="menu-group-title">{{ group.group }}</div>
-          <div 
-            v-for="item in group.items" :key="item.id"
-            :class="['menu-item', activePage === item.id ? 'active' : '']"
-            @click="switchPage(item.id)"
-          >
-            <!-- 修复：通过 iconMap 映射对象解决动态组件找不到的警告 -->
-            <el-icon class="menu-icon"><component :is="iconMap[item.icon]" /></el-icon>
-            {{ item.label }}
-          </div>
+  <div class="admin-page">
+    <div class="bg-glow"></div>
+    <div class="glass-card custom-scrollbar">
+      <!-- 1. 标题与上传区域 -->
+      <header class="admin-header">
+        <div class="title-section">
+          <el-icon :size="28" color="#409eff"><Collection /></el-icon>
+          <h2>知识库管理</h2>
         </div>
-      </div>
-      <div class="sidebar-footer">
-        <el-button link @click="$router.push('/')" :icon="HomeFilled">返回前台首页</el-button>
-      </div>
-    </aside>
-
-    <!-- 右侧主体 -->
-    <main class="main-layout">
-      <!-- 顶部 Header -->
-      <header class="header">
-        <div class="search-box">
-          <el-input placeholder="🔍 请输入搜索内容..." class="search-input" />
-        </div>
-        <div class="header-actions">
-          <!-- 消息通知 Popover -->
-          <el-popover placement="bottom" title="系统通知" :width="250" trigger="click">
-            <template #reference>
-              <el-badge :value="3" class="mr-4" type="danger" style="cursor: pointer;">
-                <el-button circle :icon="Bell" />
-              </el-badge>
-            </template>
-             <div style="font-size: 13px; color: #666; line-height: 1.8;">
-              <p><span class="text-success">●</span> 缓存命中率：{{ dashStats.metrics.cache_hit_rate || '0%' }}</p>
-              <p><span class="text-primary">●</span> 当前总用户：{{ dashStats.metrics.total_users || 0 }} 名</p>
-              <p><span class="text-warning">●</span> 知识库切片：{{ dashStats.metrics.total_chunks || 0 }} 块</p>
-            </div>
-          </el-popover>
-
-          <!-- 用户头像下拉菜单 -->
-          <el-dropdown trigger="click">
-            <el-avatar class="avatar" :size="32" :src="fullAvatarUrl" style="cursor: pointer;">
-              {{ currentUser.username ? currentUser.username.charAt(0).toUpperCase() : 'A' }}
-            </el-avatar>
-            <template #dropdown>
-              <el-dropdown-menu>
-                <el-dropdown-item @click="$router.push('/profile')">个人中心</el-dropdown-item>
-                <el-dropdown-item @click="$router.push('/')">返回前台</el-dropdown-item>
-                <el-dropdown-item divided @click="handleLogout" style="color: #f56c6c;">退出登录</el-dropdown-item>
-              </el-dropdown-menu>
-            </template>
-          </el-dropdown>
-        </div>
+        <el-upload 
+          :action="uploadUrl"
+          :headers="headers" 
+          :on-success="onUploadSuccess" 
+          :show-file-list="false"
+          accept=".pdf, .txt, .docx, .md"
+          class="upload-btn-wrapper"
+        >
+          <el-button type="primary" :icon="Plus" round>上传法规</el-button>
+        </el-upload>
       </header>
 
-      <div class="content-scroll custom-scrollbar">
-        <!-- ================== 页面1：数据概览 ================== -->
-        <section v-show="activePage === 'dashboard'" class="page">
-          <el-row :gutter="24" class="mb-4">
-            <el-col :span="6">
-              <div class="td-card">
-                <div class="td-card-title">总用户数</div>
-                <div class="metric-value">{{ dashStats.metrics.total_users || 0 }}</div>
-                <div class="metric-desc"><span class="trend-up">正常</span> 系统用户总量</div>
-              </div>
-            </el-col>
-            <el-col :span="6">
-              <div class="td-card">
-                <div class="td-card-title">有效知识切片</div>
-                <div class="metric-value">{{ dashStats.metrics.total_chunks || 0 }}</div>
-                <div class="metric-desc"><span class="trend-up">实时同步</span></div>
-              </div>
-            </el-col>
-            <el-col :span="6">
-              <div class="td-card">
-                <div class="td-card-title">语义缓存拦截率</div>
-                <div class="metric-value">{{ dashStats.metrics.cache_hit_rate || '0%' }}</div>
-                <div class="metric-desc">大幅节省 API 调用</div>
-              </div>
-            </el-col>
-            <el-col :span="6">
-              <div class="td-card">
-                <div class="td-card-title">昨日预估账单</div>
-                <div class="metric-value" style="color: #d54941">{{ dashStats.metrics.estimated_cost || '$0' }}</div>
-                <div class="metric-desc">Token 消耗折算</div>
-              </div>
-            </el-col>
-          </el-row>
+      <!-- 2. 知识库列表表格 -->
+      <div class="table-wrapper">
+        <el-table :data="docs" style="width: 100%" class="modern-table" size="small">
+          <el-table-column prop="filename" label="文件名" min-width="180" show-overflow-tooltip />
+          
+          <!-- 【核心修改】判断 chunk_count，如果是 0 显示解析中，否则显示具体数字 -->
+          <el-table-column label="切片状态" width="100" align="center">
+            <template #default="scope">
+              <el-tag v-if="scope.row.chunk_count === 0" type="warning" effect="light" size="small">
+                <el-icon class="is-loading"><Loading /></el-icon> 解析中
+              </el-tag>
+              <el-tag v-else type="success" effect="plain" size="small">
+                {{ scope.row.chunk_count }} 块
+              </el-tag>
+            </template>
+          </el-table-column>
 
-          <el-row :gutter="24">
-            <el-col :span="16">
-              <div class="td-card">
-                <div class="td-card-title">
-                  大模型 Token 消耗趋势 (7天)
-                  <el-button size="small" @click="fetchDashboard">刷新图表</el-button>
-                </div>
-                <div ref="tokenChartRef" style="height: 300px;"></div>
-              </div>
-            </el-col>
-            <el-col :span="8">
-              <div class="td-card">
-                <div class="td-card-title">高频调用用户 Top 5</div>
-                <table class="td-table">
-                  <thead><tr><th>排名</th><th>用户名</th><th>提问数</th></tr></thead>
-                  <tbody>
-                    <tr v-for="(u, idx) in dashStats.top_users" :key="idx">
-                      <td><span class="tag tag-primary">{{ idx + 1 }}</span></td>
-                      <td>{{ u.username }}</td>
-                      <td>{{ u.count }}</td>
-                    </tr>
-                  </tbody>
-                </table>
-              </div>
-            </el-col>
-          </el-row>
-        </section>
-
-        <!-- ================== 页面2：AI 引擎控制 ================== -->
-        <section v-show="activePage === 'ai-models'" class="page">
-          <div class="td-card">
-            <div class="td-card-title">
-              <span>模型配置中枢 (LLM / Embedding)</span>
-              <el-button type="primary" :icon="Plus" @click="showModelDialog = true">新增节点</el-button>
-            </div>
-            
-            <table class="td-table mt-4">
-              <thead><tr><th>类型</th><th>模型名称</th><th>提供商</th><th>Base URL</th><th>状态</th><th>操作</th></tr></thead>
-              <tbody>
-                <tr v-for="cfg in aiConfigs" :key="cfg.id">
-                  <td><el-tag size="small" type="info">{{ cfg.config_type.toUpperCase() }}</el-tag></td>
-                  <td><b>{{ cfg.model_name }}</b></td>
-                  <td>{{ cfg.provider_name }}</td>
-                  <td style="color:#888">{{ cfg.base_url }}</td>
-                  <td>
-                    <span v-if="cfg.is_active" class="tag tag-success">已启用 (活跃)</span>
-                    <span v-else class="tag tag-warning">待机</span>
-                  </td>
-                  <td>
-                    <el-switch 
-                      v-model="cfg.is_active" 
-                      @change="handleActivateConfig(cfg)"
-                      :disabled="cfg.is_active" 
-                    />
-                    <el-button 
-                      size="small" 
-                      class="ml-2" 
-                      :loading="cfg.pinging"
-                      @click="pingModel(cfg)"
-                    >测速</el-button>
-                  </td>
-                </tr>
-              </tbody>
-            </table>
-          </div>
-        </section>
-
-        <!-- ================== 页面3：知识库与题库 ================== -->
-        <section v-show="activePage === 'knowledge'" class="page">
-          <div class="td-card">
-            <div class="td-card-title">
-              <span>文档与索引管理</span>
-              <div>
-                <el-button type="warning" :icon="Edit" :loading="loadingQuiz" @click="handleGenerateQuiz">生成每日一练新题</el-button>
-                <el-upload 
-                  class="d-inline-block ml-2"
-                  :action="uploadUrl" :headers="headers" :show-file-list="false" :on-success="onUploadSuccess"
-                >
-                  <el-button type="primary" :icon="Plus">上传新法规</el-button>
-                </el-upload>
-              </div>
-            </div>
-            <table class="td-table mt-4">
-              <thead><tr><th>文档名称</th><th>上传时间</th><th>解析状态</th><th>切片数</th><th>操作</th></tr></thead>
-              <tbody>
-                <tr v-for="doc in docs" :key="doc.id">
-                  <td>{{ doc.filename }}</td>
-                  <td>{{ formatShortDate(doc.upload_time) }}</td>
-                  <td>
-                    <span v-if="doc.chunk_count === 0" class="tag tag-warning"><el-icon class="is-loading"><Loading/></el-icon> Docling 解析中</span>
-                    <span v-else class="tag tag-success">解析完成</span>
-                  </td>
-                  <td>{{ doc.chunk_count === 0 ? '--' : doc.chunk_count }}</td>
-                  <td>
-                    <el-button link type="danger" :disabled="doc.chunk_count === 0" @click="handleDeleteDoc(doc)">删除</el-button>
-                  </td>
-                </tr>
-              </tbody>
-            </table>
-            <div class="mt-4 text-center">
-              <el-button size="small" @click="fetchDocs" :icon="Refresh">刷新解析状态</el-button>
-            </div>
-          </div>
-        </section>
-
-        <!-- ================== 页面4：舆情与图谱 ================== -->
-        <section v-show="activePage === 'analytics'" class="page">
-          <el-row :gutter="24">
-            <el-col :span="12">
-              <div class="td-card">
-                <div class="td-card-title">
-                  热点话题聚类 (K-Means)
-                  <el-button size="small" :loading="analyzing" @click="startAnalysis" :icon="Refresh">重新分析</el-button>
-                </div>
-                <div ref="pieChartRef" style="height: 300px;"></div>
-              </div>
-            </el-col>
-            <el-col :span="12">
-              <div class="td-card">
-                <div class="td-card-title">AI 提取真实提问特征</div>
-                <el-scrollbar height="300px">
-                  <div v-if="hotTopics.length === 0" class="text-gray text-center mt-4">暂无分析数据</div>
-                  <div v-for="item in hotTopics" :key="item.id" class="mb-3 border-bottom pb-2">
-                    <span class="tag tag-primary mb-1">{{ item.topic_name }} ({{ item.hit_count }}次)</span>
-                    <div class="text-sm text-gray mt-1">
-                      <div v-for="(q, idx) in item.representative_queries" :key="idx">"{{ q }}"</div>
-                    </div>
-                  </div>
-                </el-scrollbar>
-              </div>
-            </el-col>
-          </el-row>
-          <div class="td-card">
-            <div class="td-card-title">
-              交通法规逻辑图谱
-              <el-button type="success" size="small" :icon="Share" :loading="loadingGraph" @click="handleBuildGraph">从知识库扩展图谱</el-button>
-            </div>
-            <div ref="graphChartRef" style="height: 450px; background: #fafafa; border: 1px solid #eee; border-radius: 8px;"></div>
-          </div>
-        </section>
-
-        <!-- ================== 页面5：用户与系统 ================== -->
-        <section v-show="activePage === 'users'" class="page">
-          <div class="td-card">
-            <div class="td-card-title">平台注册用户</div>
-            <table class="td-table">
-              <thead><tr><th>ID</th><th>用户名</th><th>注册日期</th><th>权限角色</th><th>状态</th><th>操作</th></tr></thead>
-              <tbody>
-                <tr v-for="u in users" :key="u.id">
-                  <td>{{ u.id }}</td>
-                  <td>{{ u.username }}</td>
-                  <td>{{ formatShortDate(u.created_at) }}</td>
-                  <td>
-                    <span :class="['tag', u.role === 'admin' ? 'tag-error' : 'tag-primary']">{{ u.role }}</span>
-                  </td>
-                   <td>
-                    <span v-if="u.is_active !== false" class="tag tag-success">正常</span>
-                    <span v-else class="tag tag-warning">已封禁</span>
-                  </td>
-                  <td>
-                    <el-dropdown @command="(cmd) => handleUserAction(cmd, u)">
-                      <el-button size="small" type="primary" plain>
-                        管理 <el-icon class="el-icon--right"><ArrowDown /></el-icon>
-                      </el-button>
-                      <template #dropdown>
-                        <el-dropdown-menu>
-                          <el-dropdown-item command="toggle_role">
-                            {{ u.role === 'admin' ? '降级为普通用户' : '设为管理员' }}
-                          </el-dropdown-item>
-                          <el-dropdown-item command="reset_pwd">重置密码</el-dropdown-item>
-                          <el-dropdown-item command="toggle_status" :style="{ color: u.is_active !== false ? '#e6a23c' : '#67c23a' }">
-                            {{ u.is_active !== false ? '封禁该账号' : '解封该账号' }}
-                          </el-dropdown-item>
-                          <el-dropdown-item divided command="delete" style="color: red;">删除用户</el-dropdown-item>
-                        </el-dropdown-menu>
-                      </template>
-                    </el-dropdown>
-                  </td>
-                </tr>
-              </tbody>
-            </table>
-          </div>
-        </section>
-
-        <section v-show="activePage === 'system'" class="page">
-          <div class="td-card">
-            <div class="td-card-title">微服务链路状态</div>
-            <div class="status-grid mb-4">
-              <div class="status-box"><span :class="sysStatus.mysql === 'ok' ? 'text-success' : 'text-error'">●</span> MySQL 数据库</div>
-              <div class="status-box"><span :class="sysStatus.redis === 'ok' ? 'text-success' : 'text-error'">●</span> Redis 语义缓存</div>
-            </div>
-            <div class="td-card-title">拦截日志 (Mock)</div>
-            <div class="terminal">
-              >[18:01:23] 用户请求: "外星人是否考取了地球驾照？"<br>
-              >[18:01:24] Rerank 相似度得分: 0.12 (阈值 0.35)<br>
-              > <span style="color:#f56c6c">[18:01:24] 触发防御机制，已拦截防幻觉回复。</span><br>
-              >[18:02:10] 系统心跳正常，内存占用正常...
-            </div>
-          </div>
-        </section>
-
+          <!-- 移动端隐藏上传时间列以节省空间 -->
+          <el-table-column prop="upload_time" label="日期" width="100" align="center" class-name="hidden-xs">
+            <template #default="scope">
+              {{ formatShortDate(scope.row.upload_time) }}
+            </template>
+          </el-table-column>
+          
+          <el-table-column label="操作" width="80" align="center">
+            <template #default="scope">
+              <!-- 加入防呆设计：如果在解析中，不允许删除，防止后台线程崩溃 -->
+              <el-button 
+                type="danger" 
+                link 
+                @click="handleDelete(scope.row)" 
+                :disabled="scope.row.chunk_count === 0"
+              >
+                <el-icon><Delete /></el-icon>
+              </el-button>
+            </template>
+          </el-table-column>
+        </el-table>
       </div>
-      
-      <!-- 底部状态栏 -->
+
+      <!-- 3. 数据分析看板区域 -->
+      <div class="analytics-dashboard">
+        <el-divider content-position="left">
+          <el-icon><PieChart /></el-icon> 热点分析
+        </el-divider>
+
+        <el-row :gutter="20">
+          <el-col :xs="24" :sm="10">
+            <div class="inner-card chart-box">
+              <div ref="chartRef" class="echarts-container"></div>
+            </div>
+          </el-col>
+
+          <el-col :xs="24" :sm="14">
+            <div class="inner-card topic-list">
+              <h3>🔥 智能识别热点话题</h3>
+              <el-scrollbar height="300px">
+                <div v-if="hotTopics.length === 0" class="no-data">暂无分析数据</div>
+                <div v-for="item in hotTopics" :key="item.id" class="topic-item">
+                  <div class="topic-header">
+                    <span class="topic-title">{{ item.topic_name }}</span>
+                    <el-tag size="small" type="danger" effect="dark">{{ item.hit_count }} 次</el-tag>
+                  </div>
+                  <div class="topic-keywords">
+                    <el-tag v-for="k in item.keywords" :key="k" size="small" effect="plain" class="k-tag"># {{ k }}</el-tag>
+                  </div>
+                  <div class="topic-preview">
+                    <p v-for="(q, idx) in item.representative_queries" :key="idx">“ {{ q }} ”</p>
+                  </div>
+                </div>
+              </el-scrollbar>
+            </div>
+          </el-col>
+        </el-row>
+
+        <div class="action-bar">
+          <!-- 刷新按钮也用来刷新列表状态 -->
+          <el-button type="default" @click="fetchDocs" round>
+            <el-icon><RefreshRight /></el-icon> 刷新列表状态
+          </el-button>
+          <el-button type="primary" :loading="analyzing" @click="startAnalysis" round>
+            <el-icon v-if="!analyzing"><Refresh /></el-icon> 重新分析热点
+          </el-button>
+        </div>
+      </div>
+
+      <div class="admin-actions-grid">
+        <el-card class="admin-card">
+          <h3>图谱管理</h3>
+          <p>从最新 AI 回答中提取知识链路</p>
+          <el-button type="success" :icon="Share" @click="handleBuildGraph" :loading="loadingGraph">
+            更新知识图谱
+          </el-button>
+        </el-card>
+
+        <el-card class="admin-card">
+          <h3>题库管理</h3>
+          <p>强制触发 AI 生成新的每日一练题目</p>
+          <el-button type="warning" :icon="Edit" @click="handleGenerateQuiz" :loading="loadingQuiz">
+            生成新题目
+          </el-button>
+        </el-card>
+      </div>
+
+      <!-- RAG 评估区域 -->
+      <div class="eval-section">
+        <el-divider content-position="left">
+          <el-icon><DataAnalysis /></el-icon> RAG 质量评估
+        </el-divider>
+
+        <div class="eval-actions">
+          <el-button type="primary" :icon="CaretRight" @click="handleInitDefaultDataset" :loading="loadingInitDataset">
+            初始化评估数据集
+          </el-button>
+          <el-button type="success" :icon="CaretRight" @click="handleRunEvaluation" :loading="loadingEval">
+            开始评估
+          </el-button>
+          <el-button @click="fetchEvalLatest" :icon="Refresh">刷新结果</el-button>
+        </div>
+
+        <div v-if="evalLatest.status === 'success'" class="eval-score-cards">
+          <div v-if="evalLatest.run_status === 'running'" class="eval-running-banner">
+            <el-icon class="is-loading"><Loading /></el-icon>
+            <span>评估进行中... 已完成 {{ evalLatest.completed_count || 0 }} / {{ evalLatest.total_questions || 0 }}</span>
+          </div>
+          <div class="score-card">
+            <div class="score-value">{{ formatScore(evalLatest.avg_scores?.faithfulness) }}</div>
+            <div class="score-label">忠实度</div>
+          </div>
+          <div class="score-card">
+            <div class="score-value">{{ formatScore(evalLatest.avg_scores?.context_recall) }}</div>
+            <div class="score-label">上下文召回率</div>
+          </div>
+          <div class="score-card">
+            <div class="score-value">{{ formatScore(evalLatest.avg_scores?.answer_accuracy) }}</div>
+            <div class="score-label">答案准确性</div>
+          </div>
+          <div class="score-card">
+            <div class="score-value">{{ formatScore(evalLatest.avg_scores?.answer_relevancy) }}</div>
+            <div class="score-label">回答相关性</div>
+          </div>
+        </div>
+
+        <div v-if="evalLatest.status === 'no_data'" class="no-data" style="padding: 20px; text-align: center; color: #999;">
+          暂无评估数据，请先初始化数据集并运行评估
+        </div>
+
+        <div v-if="evalLatest.details && evalLatest.details.length > 0" class="eval-detail-table">
+          <el-table :data="evalLatest.details" size="small" style="width: 100%">
+            <el-table-column prop="question" label="问题" min-width="150" show-overflow-tooltip />
+            <el-table-column prop="faithfulness" label="忠实度" width="90" align="center">
+              <template #default="scope">
+                <span :class="getScoreClass(scope.row.faithfulness)">{{ formatScore(scope.row.faithfulness) }}</span>
+              </template>
+            </el-table-column>
+            <el-table-column prop="context_recall" label="上下文召回率" width="110" align="center">
+              <template #default="scope">
+                <span :class="getScoreClass(scope.row.context_recall)">{{ formatScore(scope.row.context_recall) }}</span>
+              </template>
+            </el-table-column>
+            <el-table-column prop="answer_accuracy" label="答案准确性" width="100" align="center">
+              <template #default="scope">
+                <span :class="getScoreClass(scope.row.answer_accuracy)">{{ formatScore(scope.row.answer_accuracy) }}</span>
+              </template>
+            </el-table-column>
+            <el-table-column prop="answer_relevancy" label="回答相关性" width="100" align="center">
+              <template #default="scope">
+                <span :class="getScoreClass(scope.row.answer_relevancy)">{{ formatScore(scope.row.answer_relevancy) }}</span>
+              </template>
+            </el-table-column>
+            <el-table-column prop="avg_score" label="平均分" width="80" align="center">
+              <template #default="scope">
+                <el-tag :type="scope.row.avg_score >= 0.7 ? 'success' : scope.row.avg_score >= 0.4 ? 'warning' : 'danger'" size="small">
+                  {{ formatScore(scope.row.avg_score) }}
+                </el-tag>
+              </template>
+            </el-table-column>
+          </el-table>
+        </div>
+
+        <div v-if="evalHistory.length > 0" class="eval-history">
+          <h4>评估历史</h4>
+          <el-table :data="evalHistory" size="small">
+            <el-table-column prop="run_id" label="批次ID" width="120" />
+            <el-table-column prop="total_questions" label="问题数" width="80" align="center" />
+            <el-table-column prop="avg_score" label="平均分" width="90" align="center">
+              <template #default="scope">
+                {{ formatScore(scope.row.avg_score) }}
+              </template>
+            </el-table-column>
+            <el-table-column prop="run_time" label="时间" width="160" />
+          </el-table>
+        </div>
+      </div>
+
+      <!-- 4. 底部状态栏 -->
       <footer class="admin-footer">
         <div class="stat-item">
           <span class="label">当前有效总切片:</span>
           <span class="value">{{ totalChunks }}</span>
         </div>
+        <el-button @click="$router.push('/')" link :icon="HomeFilled">返回系统首页</el-button>
       </footer>
-    </main>
-
-    <!-- ================== 新增模型配置弹窗 ================== -->
-    <el-dialog v-model="showModelDialog" title="新增 AI 模型节点" width="500px" append-to-body>
-      <el-form :model="modelForm" label-position="top">
-        <el-form-item label="节点类型">
-          <el-radio-group v-model="modelForm.config_type">
-            <el-radio label="llm">对话模型 (LLM)</el-radio>
-            <el-radio label="embedding">向量模型 (Embedding)</el-radio>
-          </el-radio-group>
-        </el-form-item>
-        <el-form-item label="提供商 (如 Aliyun, DeepSeek)">
-          <el-input v-model="modelForm.provider_name" placeholder="请输入提供商名称" />
-        </el-form-item>
-        <el-form-item label="模型名称 (如 qwen-max)">
-          <el-input v-model="modelForm.model_name" placeholder="请输入具体的模型版本号" />
-        </el-form-item>
-        <el-form-item label="Base URL">
-          <el-input v-model="modelForm.base_url" placeholder="https://api.example.com/v1" />
-        </el-form-item>
-        <el-form-item label="API Key">
-          <el-input v-model="modelForm.api_key" type="password" show-password placeholder="sk-..." />
-        </el-form-item>
-      </el-form>
-      <template #footer>
-        <el-button @click="showModelDialog = false">取消</el-button>
-        <el-button type="primary" @click="submitNewModel" :loading="savingModel">保存配置</el-button>
-      </template>
-    </el-dialog>
+    </div>
   </div>
 </template>
 
 <script setup lang="ts">
-// 【修复】 增加了 computed 的导入
-import { ref, onMounted, nextTick, computed } from 'vue';
-import { useRouter } from 'vue-router';
-import { 
-  Guide, DataLine, Cpu, Collection, PieChart, User, Monitor, HomeFilled, 
-  Bell, Plus, Delete, Loading, Refresh, Edit, Share, ArrowDown 
-} from '@element-plus/icons-vue';
+import { ref, onMounted, onBeforeUnmount, computed, nextTick } from 'vue';
+import {Plus, Collection, Delete, PieChart, Refresh, Share, Edit, Loading, RefreshRight, HomeFilled, DataAnalysis, CaretRight } from '@element-plus/icons-vue';
 import { ElMessage, ElMessageBox } from 'element-plus';
-import * as echarts from 'echarts';
 import request from '../api/request';
-import { API_BASE_URL, STATIC_BASE_URL } from '../api/config';
-import { ADMIN_MENUS, CHART_COLORS, ADMIN_API } from '../config/constants';
+import * as echarts from 'echarts';
+import { API_BASE_URL } from '../api/config';
 
-// 【修复】 定义图标映射字典，解决 Vue 控制台动态组件找不到的问题
-const iconMap: Record<string, any> = {
-  DataLine, Cpu, Collection, PieChart, User, Monitor
-};
+const uploadUrl = computed(() => `${API_BASE_URL}/v1/chat/upload`);
 
-const router = useRouter();
-const uploadUrl = `${API_BASE_URL}/v1/chat/upload`;
-const headers = { Authorization: `Bearer ${localStorage.getItem('access_token')}` };
-const currentUser = ref({ username: '', avatar: '' });
+interface DocItem {
+  id: number;
+  filename: string;
+  chunk_count: number;
+  upload_time: string;
+}
 
-// --- 页面状态 ---
-const activePage = ref('dashboard');
-const dashStats = ref({ metrics: {} as any, chart: {} as any, top_users: [] });
-const aiConfigs = ref<any[]>([]);
-const docs = ref<any[]>([]);
-const hotTopics = ref<any[]>([]);
-const users = ref<any[]>([]);
-const sysStatus = ref({ mysql: '', redis: '' });
+interface HotTopic {
+  id: number;
+  topic_name: string;
+  keywords: string[];
+  hit_count: number;
+  representative_queries: string[];
+}
 
-// --- Loading 状态 ---
+const docs = ref<DocItem[]>([]);
+const hotTopics = ref<HotTopic[]>([]);
+const chartRef = ref<HTMLElement | null>(null);
 const analyzing = ref(false);
+const headers = { Authorization: `Bearer ${localStorage.getItem('access_token')}` };
 const loadingGraph = ref(false);
 const loadingQuiz = ref(false);
+const loadingEval = ref(false);
+const loadingInitDataset = ref(false);
+const evalLatest = ref<any>({ status: 'no_data' });
+const evalHistory = ref<any[]>([]);
+const evalPollingTimer = ref<any>(null);
+const evalActiveRun = ref<any>({ status: 'idle' });
 
-// --- 模型配置表单状态 ---
-const showModelDialog = ref(false);
-const savingModel = ref(false);
-const modelForm = ref({ config_type: 'llm', provider_name: '', model_name: '', base_url: '', api_key: '' });
-
-// 计算头像全路径
-const fullAvatarUrl = computed(() => {
-  if (!currentUser.value.avatar) return '';
-  return `${STATIC_BASE_URL}${currentUser.value.avatar}?t=${Date.now()}`;
-});
-
-// 【修复】 补充底部的总切片计算
-const totalChunks = computed(() => docs.value.reduce((acc, cur) => acc + (cur.chunk_count || 0), 0));
-
-// --- 图表 Refs ---
-const tokenChartRef = ref<HTMLElement | null>(null);
-const pieChartRef = ref<HTMLElement | null>(null);
-const graphChartRef = ref<HTMLElement | null>(null);
-let charts: echarts.ECharts[] =[];
-
-// --- 方法：切换菜单 ---
-const switchPage = async (pageId: string) => {
-  activePage.value = pageId;
-  if (pageId === 'dashboard') await fetchDashboard();
-  if (pageId === 'ai-models') await fetchConfigs();
-  if (pageId === 'knowledge') await fetchDocs();
-  if (pageId === 'analytics') {
-    await fetchHotTopics();
-    await fetchGraph();
-  }
-  if (pageId === 'users') await fetchUsers();
-  if (pageId === 'system') await fetchSystemStatus();
-};
-
-// --- 方法：登出 ---
-const handleLogout = () => {
-  localStorage.removeItem('access_token');
-  router.push('/login');
-};
-
-// --- 方法：API 调用 ---
-const fetchDashboard = async () => {
-  const res = await request.get(ADMIN_API.STATS);
-  dashStats.value = res.data;
-  await nextTick();
-  initTokenChart(res.data.chart);
-};
-
-const fetchConfigs = async () => {
-  const res = await request.get(ADMIN_API.CONFIGS);
-  aiConfigs.value = res.data;
-};
-
-const handleActivateConfig = async (cfg: any) => {
-  try {
-    await request.patch(ADMIN_API.ACTIVATE_CONFIG(cfg.id));
-    ElMessage.success(`已切换活跃模型至: ${cfg.model_name}`);
-    await fetchConfigs();
-  } catch (e) {
-    cfg.is_active = false;
-  }
-};
-
-const pingModel = async (cfg: any) => {
-  cfg.pinging = true;
-  try {
-    const res = await request.post(`/v1/admin/configs/${cfg.id}/ping`);
-    ElMessage.success(`✅ 测速成功：${res.data.message} (延迟: ${res.data.delay}ms)`);
-  } catch (e: any) {
-    ElMessage.error(`❌ 测速失败：${e.response?.data?.detail || '网络超时'}`);
-  } finally {
-    cfg.pinging = false;
-  }
-};
-
-const submitNewModel = async () => {
-  if (!modelForm.value.model_name || !modelForm.value.api_key) return ElMessage.warning("请填写完整参数");
-  savingModel.value = true;
-  try {
-    await request.post('/v1/admin/configs', modelForm.value);
-    ElMessage.success("新增节点成功！");
-    showModelDialog.value = false;
-    modelForm.value = { config_type: 'llm', provider_name: '', model_name: '', base_url: '', api_key: '' }; // 重置表单
-    fetchConfigs();
-  } catch (e) {
-    ElMessage.error("保存失败");
-  } finally { savingModel.value = false; }
-};
-
-const fetchDocs = async () => {
-  const res = await request.get('/v1/chat/knowledge_list');
-  docs.value = res.data;
-};
-
-const onUploadSuccess = (response: any) => {
-  if (response.status === 'processing') ElMessage.success('已放入后台解析队列');
-  else ElMessage.success('上传成功');
-  fetchDocs();
-};
-
-const handleDeleteDoc = async (row: any) => {
-  await ElMessageBox.confirm(`确定删除 ${row.filename} 吗？`, '警告', { type: 'warning' });
-  await request.delete(`/v1/chat/knowledge/${row.id}`);
-  ElMessage.success('删除成功');
-  fetchDocs();
+const initChart = (data: { topic: string; count: number }[]) => {
+  if (!chartRef.value || !data.length) return;
+  const myChart = echarts.init(chartRef.value);
+  const option = {
+    title: { text: '咨询热点分布', left: 'center', textStyle: { fontSize: 14 } },
+    tooltip: { trigger: 'item', formatter: '{b}: {c}' },
+    series:[
+      {
+        type: 'pie',
+        radius: ['40%', '70%'],
+        avoidLabelOverlap: false,
+        itemStyle: { borderRadius: 10, borderColor: '#fff', borderWidth: 2 },
+        label: { show: false },
+        data: data.map(item => ({ value: item.count, name: item.topic }))
+      }
+    ]
+  };
+  myChart.setOption(option);
+  window.addEventListener('resize', () => myChart.resize());
 };
 
 const fetchHotTopics = async () => {
-  const res = await request.get('/v1/chat/analytics');
-  hotTopics.value = res.data;
-  await nextTick();
-  initPieChart(res.data);
+  try {
+    const res = await request.get('/v1/chat/analytics');
+    hotTopics.value = res.data;
+    if (hotTopics.value.length > 0) {
+      await nextTick();
+      initChart(hotTopics.value.map(i => ({ topic: i.topic_name, count: i.hit_count })));
+    }
+  } catch (e) {
+    console.error("加载分析数据失败");
+  }
+};
+
+const fetchDocs = async () => {
+  try {
+    const res = await request.get('/v1/chat/knowledge_list');
+    docs.value = res.data;
+    await fetchHotTopics();
+  } catch (e) {
+    ElMessage.error('获取知识库列表失败');
+  }
 };
 
 const startAnalysis = async () => {
   analyzing.value = true;
   try {
     await request.post('/v1/chat/perform_analysis');
-    ElMessage.success('热点分析已更新');
+    ElMessage.success('分析完成');
     await fetchHotTopics();
-  } finally { analyzing.value = false; }
+  } catch (e) {
+    ElMessage.error('分析失败');
+  } finally {
+    analyzing.value = false;
+  }
 };
 
-const fetchGraph = async () => {
-  const res = await request.get('/v1/chat/knowledge_graph');
-  await nextTick();
-  initGraphChart(res.data);
+// 【核心修改】处理上传成功后的反馈
+const onUploadSuccess = (response: any) => {
+  if (response.status === 'processing') {
+    // 后端返回 processing，说明已进入后台队列
+    ElMessage.success({
+      message: response.message || '文件已放入后台解析队列',
+      duration: 4000
+    });
+  } else {
+    ElMessage.success('上传并解析成功');
+  }
+  // 无论哪种情况，立刻刷新列表，把 chunk_count = 0 的记录展示出来
+  fetchDocs();
+};
+
+const handleDelete = async (row: DocItem) => {
+  try {
+    await ElMessageBox.confirm(`确定删除 [${row.filename}] 吗？`, '警告', { type: 'warning' });
+    await request.delete(`/v1/chat/knowledge/${row.id}`);
+    ElMessage.success('删除成功');
+    fetchDocs();
+  } catch (e) {}
 };
 
 const handleBuildGraph = async () => {
   loadingGraph.value = true;
-  ElMessage.info('图谱更新任务已后台启动...');
+  ElMessage.info('图谱更新任务已在后台启动，处理约需 1-2 分钟...');
   try {
     await request.post('/v1/chat/build_graph');
-  } finally { loadingGraph.value = false; }
+    setTimeout(() => {
+        ElMessage.success('后台正在处理中，稍后请刷新页面查看变化');
+    }, 2000);
+  } catch (e) { 
+    ElMessage.error('任务启动失败'); 
+  } finally {
+    loadingGraph.value = false;
+  }
 };
 
 const handleGenerateQuiz = async () => {
   loadingQuiz.value = true;
-  ElMessage.info('题库生成任务已后台启动...');
+  ElMessage.info('题库生成任务已在后台启动，处理约需 1-2 分钟...');
   try {
     await request.post('/v1/quiz/admin_generate');
-  } finally { loadingQuiz.value = false; }
-};
-
-const fetchUsers = async () => {
-  const res = await request.get(ADMIN_API.USERS);
-  users.value = res.data;
-};
-
-const handleUserAction = async (cmd: string, user: any) => {
-  try {
-    if (cmd === 'toggle_role') {
-      const newRole = user.role === 'admin' ? 'user' : 'admin';
-      await request.patch(`/v1/admin/users/${user.id}/role`, null, { params: { role: newRole } });
-      ElMessage.success(`角色已更新为 ${newRole}`);
-      fetchUsers();
-    } 
-    else if (cmd === 'reset_pwd') {
-      await ElMessageBox.confirm(`确定要将 ${user.username} 的密码重置为 123456 吗？`, '警告');
-      await request.post(`/v1/admin/users/${user.id}/reset_password`);
-      ElMessage.success('密码重置成功');
-    } 
-    else if (cmd === 'toggle_status') {
-      const targetStatus = user.is_active === false ? true : false;
-      const actionName = targetStatus ? '解封' : '封禁';
-      await ElMessageBox.confirm(`确定要 ${actionName} 用户 ${user.username} 吗？`, '账号管理');
-      await request.patch(`/v1/admin/users/${user.id}/status`, null, { params: { is_active: targetStatus } });
-      ElMessage.success(`已成功${actionName}`);
-      fetchUsers();
-    }
-    else if (cmd === 'delete') {
-      await ElMessageBox.confirm(`此操作将永久删除用户 ${user.username} 及其所有对话记录，确定继续？`, '危险操作', { type: 'error' });
-      await request.delete(`/v1/admin/users/${user.id}`);
-      ElMessage.success('用户已删除');
-      fetchUsers();
-    }
-  } catch (e: any) {
-    ElMessage.error(e.response?.data?.detail || "操作失败");
+    setTimeout(() => {
+        ElMessage.success('后台正在疯狂出题中，稍后可去刷题查看！');
+    }, 2000);
+  } catch (e) { 
+    ElMessage.error('生成任务启动失败'); 
+  } finally {
+    loadingQuiz.value = false;
   }
 };
 
-const fetchSystemStatus = async () => {
-  const res = await request.get(ADMIN_API.SYS_STATUS);
-  sysStatus.value = res.data;
+// 辅助计算
+const totalChunks = computed(() => docs.value.reduce((acc, cur) => acc + cur.chunk_count, 0));
+const formatShortDate = (t: string) => {
+  const d = new Date(t);
+  return `${d.getMonth()+1}-${d.getDate()}`;
 };
 
-// --- ECharts 渲染逻辑 ---
-const initTokenChart = (data: any) => {
-  if (!tokenChartRef.value) return;
-  const chart = echarts.init(tokenChartRef.value);
-  chart.setOption({
-    tooltip: { trigger: 'axis' },
-    legend: { data: ['Input Token', 'Output Token'] },
-    xAxis: { type: 'category', data: data.days },
-    yAxis: { type: 'value' },
-    series:[
-      { name: 'Input Token', type: 'line', smooth: true, data: data.input_tokens, itemStyle: { color: CHART_COLORS.primary } },
-      { name: 'Output Token', type: 'line', smooth: true, data: data.output_tokens, itemStyle: { color: CHART_COLORS.success } }
-    ]
-  });
-  charts.push(chart);
+const formatScore = (val: number | null | undefined) => {
+  if (val === null || val === undefined) return '-';
+  return (val * 100).toFixed(1) + '%';
 };
 
-const initPieChart = (data: any[]) => {
-  if (!pieChartRef.value || !data.length) return;
-  const chart = echarts.init(pieChartRef.value);
-  chart.setOption({
-    tooltip: { trigger: 'item' },
-    series:[{
-      type: 'pie', radius:['40%', '70%'],
-      data: data.map((item, i) => ({ 
-        value: item.hit_count, name: item.topic_name, 
-        itemStyle: { color: CHART_COLORS.pieColors[i % CHART_COLORS.pieColors.length] } 
-      }))
-    }]
-  });
-  charts.push(chart);
+const getScoreClass = (val: number | null | undefined) => {
+  if (val === null || val === undefined) return 'score-na';
+  if (val >= 0.7) return 'score-good';
+  if (val >= 0.4) return 'score-mid';
+  return 'score-bad';
 };
 
-const initGraphChart = (data: any) => {
-  if (!graphChartRef.value || !data.nodes || data.nodes.length === 0) return;
-  const chart = echarts.init(graphChartRef.value);
-  
-  // 动态提取类别
-  const categoriesSet = new Set(data.nodes.map((n: any) => n.category));
-  const categories = Array.from(categoriesSet).map(name => ({ name }));
-
-  chart.setOption({
-    tooltip: {
-      formatter: function (params: any) {
-        if (params.dataType === 'node') return `实体: ${params.data.name}<br>类别: ${params.data.category}`;
-        return `关系: ${params.data.value}`;
-      }
-    }, 
-    animationDurationUpdate: 1500, animationEasingUpdate: 'quinticInOut',
-    series:[{
-      type: 'graph', layout: 'force', symbolSize: 35, roam: true,
-      label: { show: true, fontSize: 11, position: 'right' }, 
-      edgeSymbol:['none', 'arrow'], edgeSymbolSize: [4, 6],
-      data: data.nodes.map((n:any) => ({ name: n.name, category: n.category, itemStyle: { shadowBlur: 10, shadowColor: 'rgba(0,0,0,0.2)' } })),
-      links: data.links,
-      categories: categories,
-      force: { repulsion: 300, edgeLength:[80, 150] },
-      lineStyle: { color: 'source', curveness: 0.2 }
-    }]
-  });
-  charts.push(chart);
+const fetchEvalLatest = async () => {
+  try {
+    const res = await request.get('/v1/evaluation/latest');
+    evalLatest.value = res.data;
+  } catch (e) {
+    console.error('获取评估结果失败');
+  }
 };
 
-window.addEventListener('resize', () => charts.forEach(c => c.resize()));
+const fetchEvalHistory = async () => {
+  try {
+    const res = await request.get('/v1/evaluation/history');
+    evalHistory.value = res.data;
+  } catch (e) {
+    console.error('获取评估历史失败');
+  }
+};
 
-const formatShortDate = (t: string) => t ? t.substring(0, 10) : '';
+const fetchActiveRun = async () => {
+  try {
+    const res = await request.get('/v1/evaluation/active_run');
+    evalActiveRun.value = res.data;
+  } catch (e) {
+    console.error('获取评估状态失败');
+  }
+};
+
+const startEvalPolling = () => {
+  stopEvalPolling();
+  evalPollingTimer.value = setInterval(async () => {
+    await fetchActiveRun();
+    await fetchEvalLatest();
+    if (evalActiveRun.value.status !== 'running') {
+      stopEvalPolling();
+      fetchEvalHistory();
+    }
+  }, 30000);
+};
+
+const stopEvalPolling = () => {
+  if (evalPollingTimer.value) {
+    clearInterval(evalPollingTimer.value);
+    evalPollingTimer.value = null;
+  }
+};
+
+const handleRunEvaluation = async () => {
+  loadingEval.value = true;
+  try {
+    const res = await request.post('/v1/evaluation/run');
+    ElMessage.success(res.data.message || '评估任务已启动');
+    evalActiveRun.value = { status: 'running', run_id: res.data.run_id, total: 0, completed_count: 0, progress: 0 };
+    startEvalPolling();
+  } catch (e: any) {
+    ElMessage.error(e.response?.data?.detail || '评估启动失败');
+  } finally {
+    loadingEval.value = false;
+  }
+};
+
+const handleInitDefaultDataset = async () => {
+  loadingInitDataset.value = true;
+  try {
+    const res = await request.post('/v1/evaluation/datasets/init_default');
+    ElMessage.success(res.data.message || '初始化完成');
+  } catch (e: any) {
+    ElMessage.error(e.response?.data?.detail || '初始化失败');
+  } finally {
+    loadingInitDataset.value = false;
+  }
+};
 
 onMounted(async () => {
-  try {
-    const res = await request.get('/v1/chat/me');
-    currentUser.value = res.data;
-  } catch (e) {
-    console.error("获取管理员信息失败");
+  fetchDocs();
+  fetchEvalLatest();
+  fetchEvalHistory();
+  await fetchActiveRun();
+  if (evalActiveRun.value.status === 'running') {
+    startEvalPolling();
   }
-  await switchPage('dashboard');
+});
+
+onBeforeUnmount(() => {
+  stopEvalPolling();
 });
 </script>
 
 <style scoped lang="scss">
-.admin-layout-wrapper {
-  display: flex; height: 100vh; background: #f3f4f7; color: #181818; overflow: hidden;
+.admin-page {
+  height: 100vh; width: 100vw; display: flex; justify-content: center; align-items: center;
+  background: #f0f2f5; position: relative; overflow: hidden;
 }
 
-.sidebar {
-  width: 232px; background: #fff; border-right: 1px solid #e7e7e7;
-  display: flex; flex-direction: column; z-index: 100;
-  .logo { height: 64px; display: flex; align-items: center; padding: 0 24px; font-size: 18px; font-weight: bold; color: #0052d9; border-bottom: 1px solid #e7e7e7; }
-  .menu-list { flex: 1; padding: 12px 0; }
-  .menu-group-title { padding: 12px 24px 4px; font-size: 12px; color: #5e6066; }
-  .menu-item {
-    padding: 12px 24px; margin: 4px 8px; border-radius: 4px; cursor: pointer; display: flex; align-items: center; font-size: 14px; transition: 0.2s;
-    &:hover { background: #f2f3f5; }
-    &.active { background: rgba(0, 82, 217, 0.1); color: #0052d9; font-weight: bold; }
-    .menu-icon { margin-right: 10px; font-size: 16px; }
+.bg-glow {
+  position: absolute; width: 600px; height: 600px; background: rgba(64, 158, 255, 0.1);
+  filter: blur(100px); top: -200px; left: -200px;
+}
+
+.glass-card {
+  width: 95%; 
+  max-width: 1100px; 
+  height: 94%; 
+  background: rgba(255, 255, 255, 0.8);
+  backdrop-filter: blur(20px); 
+  border-radius: 24px; 
+  border: 1px solid rgba(255,255,255,0.5);
+  display: flex; 
+  flex-direction: column; 
+  padding: 20px; 
+  box-shadow: 0 20px 50px rgba(0,0,0,0.05);
+  overflow-y: auto;
+
+  @media (max-width: 768px) {
+    width: 100%;
+    height: 100%;
+    border-radius: 0;
+    padding: 15px;
   }
-  .sidebar-footer { padding: 15px; border-top: 1px solid #e7e7e7; text-align: center; }
 }
 
-.main-layout { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+.admin-header {
+  display: flex; 
+  justify-content: space-between; 
+  align-items: center; 
+  margin-bottom: 20px;
 
-.header {
-  height: 64px; background: #fff; border-bottom: 1px solid #e7e7e7;
-  display: flex; justify-content: space-between; align-items: center; padding: 0 24px;
-  .search-input { width: 300px; }
-  .header-actions { display: flex; align-items: center; }
-  .avatar { background: #0052d9; color: #fff; cursor: pointer; }
+  @media (max-width: 768px) {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 15px;
+    .upload-btn-wrapper { width: 100%; .el-button { width: 100%; } }
+  }
+
+  .title-section { display: flex; align-items: center; gap: 10px; h2 { margin: 0; font-size: 20px; } }
 }
 
-.content-scroll { flex: 1; padding: 24px; overflow-y: auto; }
-
-/* TDesign 卡片 */
-.td-card {
-  background: #fff; border-radius: 8px; padding: 24px; margin-bottom: 24px; box-shadow: 0 1px 4px rgba(0,0,0,0.02);
-  .td-card-title { font-size: 16px; font-weight: bold; margin-bottom: 16px; display: flex; justify-content: space-between; align-items: center; }
+.table-wrapper { 
+  margin-bottom: 20px; 
+  /* 解决移动端表格溢出 */
+  :deep(.el-table__inner-wrapper) { overflow-x: auto; }
 }
 
-/* 指标项 */
-.metric-value { font-size: 28px; font-weight: bold; margin: 8px 0; color: #181818; }
-.metric-desc { font-size: 12px; color: #5e6066; .trend-up { color: #2ba471; margin-right: 5px; font-weight: bold; } }
+.analytics-dashboard {
+  .inner-card {
+    background: rgba(255,255,255,0.5); border-radius: 16px; padding: 15px; margin-bottom: 20px;
+    border: 1px solid rgba(0,0,0,0.03);
+  }
+  
+  .echarts-container {
+    height: 300px; width: 100%;
+    @media (max-width: 768px) { height: 250px; }
+  }
 
-/* 表格与标签 */
-.td-table {
-  width: 100%; border-collapse: collapse; font-size: 13px;
-  th, td { padding: 12px; text-align: left; border-bottom: 1px solid #e7e7e7; }
-  th { background: #fbfbfb; color: #5e6066; font-weight: normal; }
+  .no-data { text-align: center; color: #999; padding: 20px; }
+  .action-bar { text-align: center; margin-bottom: 20px; }
 }
-.tag { display: inline-block; padding: 2px 8px; border-radius: 3px; font-size: 12px; }
-.tag-success { background: #e3f9e9; color: #2ba471; }
-.tag-warning { background: #fff1e9; color: #e37318; }
-.tag-error { background: #ffedeb; color: #d54941; }
-.tag-primary { background: #e0ebff; color: #0052d9; }
 
-/* 其他公用样式 */
-.mb-4 { margin-bottom: 16px; } .mt-4 { margin-top: 16px; } .mr-4 { margin-right: 16px; }
-.d-inline-block { display: inline-block; } .ml-2 { margin-left: 8px; }
-.border-bottom { border-bottom: 1px dashed #eee; } .pb-2 { padding-bottom: 8px; }
-.text-sm { font-size: 12px; } .text-gray { color: #666; }
-.text-success { color: #2ba471; } .text-error { color: #d54941; }
-
-.status-grid { display: flex; gap: 20px; .status-box { padding: 15px; border: 1px solid #eee; border-radius: 8px; background: #fafafa; font-size: 14px;} }
-.terminal { background: #1e1e1e; color: #4ade80; padding: 16px; border-radius: 6px; font-family: monospace; height: 150px; overflow-y: auto; font-size: 13px; line-height: 1.6; }
-
-.custom-scrollbar::-webkit-scrollbar { width: 6px; }
-.custom-scrollbar::-webkit-scrollbar-thumb { background: #ccc; border-radius: 4px; }
+.topic-item {
+  background: #fff; padding: 12px; border-radius: 12px; margin-bottom: 10px;
+  .topic-header { 
+    display: flex; justify-content: space-between; align-items: center;
+    .topic-title { font-weight: bold; color: #333; font-size: 14px; }
+  }
+  .topic-keywords { margin: 6px 0; display: flex; flex-wrap: wrap; gap: 4px; }
+  .topic-preview { 
+    font-size: 11px; color: #888; font-style: italic; 
+    p { margin: 2px 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  }
+}
 
 .admin-footer {
-  padding: 15px 24px;
-  background: #fff;
-  border-top: 1px solid #e7e7e7;
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
+  margin-top: auto; padding-top: 15px; border-top: 1px solid rgba(0,0,0,0.05);
+  display: flex; justify-content: space-between; align-items: center;
   .stat-item {
-    font-size: 13px;
-    color: #5e6066;
-    .value { font-weight: bold; color: #0052d9; margin-left: 8px; }
+    font-size: 13px; color: #666;
+    .value { font-weight: bold; color: #409eff; margin-left: 5px; }
   }
+}
+
+/* 移动端隐藏特定列 */
+@media (max-width: 600px) {
+  .hidden-xs { display: none !important; }
+}
+
+.custom-scrollbar::-webkit-scrollbar { width: 4px; }
+.custom-scrollbar::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.1); border-radius: 10px; }
+
+.eval-section {
+  margin-top: 20px;
+
+  .eval-actions {
+    display: flex; gap: 10px; margin-bottom: 20px; flex-wrap: wrap;
+  }
+
+  .eval-score-cards {
+    display: grid; grid-template-columns: repeat(4, 1fr); gap: 15px; margin-bottom: 20px;
+
+    @media (max-width: 768px) {
+      grid-template-columns: repeat(2, 1fr);
+    }
+
+    .eval-running-banner {
+      grid-column: 1 / -1;
+      background: linear-gradient(135deg, #e6a23c 0%, #f56c6c 100%);
+      border-radius: 12px; padding: 12px 20px; text-align: center; color: #fff;
+      display: flex; align-items: center; justify-content: center; gap: 8px;
+      font-size: 14px;
+    }
+
+    .score-card {
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      border-radius: 16px; padding: 20px; text-align: center; color: #fff;
+
+      .score-value {
+        font-size: 28px; font-weight: bold; margin-bottom: 5px;
+      }
+
+      .score-label {
+        font-size: 12px; opacity: 0.85;
+      }
+    }
+  }
+
+  .eval-detail-table {
+    margin-bottom: 20px;
+  }
+
+  .eval-history {
+    h4 { margin: 10px 0; color: #333; }
+  }
+
+  .score-good { color: #67c23a; font-weight: bold; }
+  .score-mid { color: #e6a23c; font-weight: bold; }
+  .score-bad { color: #f56c6c; font-weight: bold; }
+  .score-na { color: #999; }
 }
 </style>

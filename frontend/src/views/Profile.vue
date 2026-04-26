@@ -139,7 +139,7 @@ import { ref, onMounted, computed } from 'vue';
 import { useRouter } from 'vue-router';
 import { 
   Camera, SwitchButton, Tools, Share, 
-  User, Monitor, Lock, EditPen, UserFilled, Cpu // <--- 关键修复 2：导入 UserFilled
+  User, Monitor, Lock, EditPen, UserFilled,Cpu // <--- 关键修复 2：导入 UserFilled
 } from '@element-plus/icons-vue';
 import { ElMessage, ElMessageBox } from 'element-plus';
 import request from '../api/request';
