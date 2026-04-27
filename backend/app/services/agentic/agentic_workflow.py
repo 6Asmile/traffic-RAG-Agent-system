@@ -466,10 +466,45 @@ class AgenticWorkflowManager:
                 content = item.get("content", "")
                 if not content:
                     continue
-                blocks.append(f"[{header}]\n{content}")
+                blocks.append(f"[依据{index + 1}] {header}\n{content}")
             if blocks:
                 return "\n\n".join(blocks)
-        return "\n\n".join(documents).strip() or "无"
+        if documents:
+            blocks = []
+            for index, content in enumerate(documents):
+                normalized = str(content or "").strip()
+                if not normalized:
+                    continue
+                blocks.append(f"[依据{index + 1}] 检索片段 {index + 1}\n{normalized}")
+            if blocks:
+                return "\n\n".join(blocks)
+        return "无"
+
+    @staticmethod
+    def _normalize_legal_citations(answer: str, law_sources: list[dict], need_law: bool) -> str:
+        text = str(answer or "").strip()
+        if not text:
+            return text
+
+        # 统一引用标记，避免模型输出 [资料1]/[source1] 造成前端与文案不一致
+        text = re.sub(r"\[(?:资料|source|Source)\s*([0-9]+)\]", r"[依据\1]", text)
+
+        if not need_law:
+            return text
+
+        has_citation = bool(re.search(r"\[依据\s*\d+\]", text))
+        if has_citation:
+            return text
+
+        # 若模型漏标注，则补充引用映射，至少让用户能看到明确依据编号
+        if law_sources:
+            lines = []
+            for i, item in enumerate(law_sources[:5]):
+                title = str(item.get("title") or item.get("label") or f"法规依据 {i + 1}").strip()
+                lines.append(f"[依据{i + 1}] {title}")
+            if lines:
+                text = f"{text}\n\n引用依据：\n" + "\n".join(lines)
+        return text
 
     def _recall_memory_contexts(self, state: AgenticState, query: str) -> list[str]:
         if not self.state_store:
@@ -861,6 +896,13 @@ class AgenticWorkflowManager:
         original_query = state.get("original_query", "")
         search_query = state.get("search_query", "")
         question = search_query if search_query and search_query != original_query else original_query
+        handoff_router = state.get("handoff_router", {}) or {}
+        router_caps = [
+            str(cap).strip()
+            for cap in (handoff_router.get("need_capabilities", []) or [])
+            if str(cap).strip()
+        ]
+        need_law = bool(handoff_router.get("need_law")) or ("law_search" in router_caps)
 
         documents = state.get("private_documents", [])
         law_sources = state.get("public_sources", [])
@@ -891,6 +933,7 @@ class AgenticWorkflowManager:
             answer = "生成阶段超时或失败，请稍后重试。"
         else:
             answer = str(result.content or "").strip()
+        answer = self._normalize_legal_citations(answer, law_sources, need_law)
 
         handoff_synth = SynthAgentSubgraph.build_handoff(
             answer=answer,
