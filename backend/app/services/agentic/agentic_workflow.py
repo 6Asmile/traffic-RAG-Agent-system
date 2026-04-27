@@ -600,10 +600,21 @@ class AgenticWorkflowManager:
             selected_law_tool = law_candidate_tools[0]
             law_tool_obj = self.tools[selected_law_tool]
             law_policy = self._get_tool_policy(selected_law_tool)
+            run_id = str(state.get("run_id", "") or "").strip()
+            session_id = str(state.get("session_id", "") or "").strip() or "default"
+            user_id = str(state.get("user_id", "") or "").strip() or "anonymous"
             raw_result, law_metrics, law_err = await self._run_guarded(
                 "law",
                 f"law_search_{selected_law_tool}",
-                lambda: law_tool_obj.ainvoke({"query": query}),
+                lambda: law_tool_obj.ainvoke(
+                    {
+                        "query": query,
+                        "run_id": run_id,
+                        "session_id": session_id,
+                        "user_id": user_id,
+                        "mode": "expert",
+                    }
+                ),
                 policy_override=law_policy,
             )
             law_metrics["policy"] = law_policy

@@ -178,8 +178,8 @@
                     </template>
                     <div class="source-scroll-container">
                       <div v-for="(s, i) in msg.sources" :key="i" class="src-item-card">
-                        <div class="src-label">依据 {{ i + 1 }}</div>
-                        <div class="src-text markdown-body" v-html="renderMarkdown(s)"></div>
+                        <div class="src-label">{{ s.title || s.label || `依据 ${i + 1}` }}</div>
+                        <div class="src-text markdown-body" v-html="renderMarkdown(s.content)"></div>
                       </div>
                     </div>
                   </el-popover>
@@ -188,7 +188,7 @@
             </div>
           </div>
           
-          <div v-if="loading && (!chatHistory[chatHistory.length - 1].thinking || chatHistory[chatHistory.length - 1].thinking.length === 0)" class="msg-row is-ai">
+          <div v-if="loading && ((chatHistory[chatHistory.length - 1]?.thinking?.length ?? 0) === 0)" class="msg-row is-ai">
             <div class="msg-bubble loading-bubble">
               <div class="typing-dots"><span></span><span></span><span></span></div>
             </div>
@@ -243,11 +243,17 @@ import { TextToSpeech } from '@capacitor-community/text-to-speech';
 
 // --- 类型定义 ---
 interface SessionItem { id: string; title: string; updated_at?: string; }
+interface SourceItem {
+  type?: string;
+  title?: string;
+  label?: string;
+  content: string;
+}
 interface Message { 
   id?: number;
   role: 'user' | 'ai'; 
   content: string; 
-  sources?: string[]; 
+  sources?: SourceItem[]; 
   thinking?: string[]; // 🌟 新增思考过程数组
   is_helpful?: boolean | null;
 }
@@ -271,6 +277,44 @@ const fullAvatarUrl = computed(() => {
   return `${STATIC_BASE_URL}${currentUser.value.avatar}?t=${Date.now()}`;
 });
 const currentSessionTitle = computed(() => sessions.value.find(i => i.id === currentSessionId.value)?.title || '新对话');
+
+const safeParseJsonArray = (raw: unknown): any[] => {
+  if (Array.isArray(raw)) return raw;
+  if (typeof raw !== 'string' || !raw.trim()) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+};
+
+const normalizeSources = (raw: unknown): SourceItem[] => {
+  if (!Array.isArray(raw)) return [];
+  const result: SourceItem[] = [];
+  raw.forEach((item: unknown, index: number) => {
+    if (typeof item === 'string') {
+      result.push({
+        type: 'law',
+        title: `依据 ${index + 1}`,
+        label: `检索片段 ${index + 1}`,
+        content: item,
+      });
+      return;
+    }
+    if (item && typeof item === 'object') {
+      const content = typeof (item as any).content === 'string' ? (item as any).content : '';
+      if (!content) return;
+      result.push({
+        type: typeof (item as any).type === 'string' ? (item as any).type : 'law',
+        title: typeof (item as any).title === 'string' ? (item as any).title : `依据 ${index + 1}`,
+        label: typeof (item as any).label === 'string' ? (item as any).label : `检索片段 ${index + 1}`,
+        content,
+      });
+    }
+  });
+  return result;
+};
 
 // --- ASR 逻辑 ---
 const isRecording = ref(false);
@@ -348,7 +392,7 @@ const fetchHistory = async (id: string) => {
     is_helpful: m.is_helpful,
     role: m.role as 'user'|'ai', 
     content: m.content, 
-    sources: typeof m.sources === 'string' ? JSON.parse(m.sources) : (m.sources || []),
+    sources: normalizeSources(safeParseJsonArray(m.sources)),
     thinking:[] // 历史记录不显示思考过程
   }));
   await scrollToBottom();
@@ -387,6 +431,10 @@ const handleSend = async () => {
       },
       body: JSON.stringify({ question, session_id: sid })
     });
+
+    if (!response.ok) {
+      throw new Error(`请求失败: ${response.status}`);
+    }
     
     if (!response.body) throw new Error("No Body");
     const reader = response.body.getReader();
@@ -407,7 +455,7 @@ const handleSend = async () => {
             const payload = JSON.parse(jsonStr);
             
             if (payload.type === 'sources') {
-              aiMsg.sources = payload.data;
+              aiMsg.sources = normalizeSources(payload.data);
             } else if (payload.type === 'content') {
                 const text = payload.data;
                 // 🌟 核心黑科技：剥离提取中间过程（思考状态）
@@ -436,8 +484,8 @@ const handleSend = async () => {
       await nextTick();
     }
     await fetchSessions();
-  } catch (e) { 
-    aiMsg.content += "\n⚠️ 连接中断"; 
+  } catch (e: any) { 
+    aiMsg.content += `\n⚠️ ${e?.message || '连接中断'}`; 
   } finally { 
     loading.value = false; 
     await scrollToBottom(); 

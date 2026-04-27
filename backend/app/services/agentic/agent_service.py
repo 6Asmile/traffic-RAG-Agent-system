@@ -4,6 +4,7 @@ import os
 import json
 import logging
 import re
+import time
 from typing import AsyncGenerator
 from sqlalchemy.orm import Session
 from langchain_openai import ChatOpenAI
@@ -30,6 +31,7 @@ from app.services.rag_service import AliyunEmbeddingWrapper, AliyunReranker
 from app.services.agentic.agentic_workflow import AgenticWorkflowManager
 from app.services.agentic.state_store import AgentStateStore
 from app.services.agentic.tool_registry import ToolRegistry
+from app.services.retrieval_metrics_service import RetrievalMetricsService
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +56,7 @@ class AgenticRAGService:
 
         self.cache = CacheManager(self.redis_client)
         self.state_store = AgentStateStore(self.redis_client, db=self.db)
+        self.retrieval_metrics = RetrievalMetricsService(self.db)
 
         user_prefs = current_user.ai_preferences if (current_user and current_user.ai_preferences) else {}
         final_llm_model = user_prefs.get("llm_model") or llm_cfg.model_name
@@ -89,6 +92,7 @@ class AgenticRAGService:
                 "bm25_instance": self.bm25_instance,
                 "bm25_corpus": self.bm25_corpus,
                 "reranker": self.reranker,
+                "retrieval_metrics_service": self.retrieval_metrics,
             }
         )
         all_tools = load_result.tools
@@ -171,6 +175,7 @@ class AgenticRAGService:
     async def agentic_chat_stream(self, query: str, session_id: str) -> AsyncGenerator[str, None]:
         print(f"\n{'=' * 20}[专家模式提问] {'=' * 20}")
         print(f"👤 用户问题: {query}")
+        request_started = time.perf_counter()
 
         run_id = self.state_store.create_run_id(session_id)
         safe_user_id = str(self.current_user_id) if self.current_user_id not in (None, "") else "anonymous"
@@ -227,6 +232,7 @@ class AgenticRAGService:
         last_sources_payload = None
         last_risk_payload = None
         done_sent = False
+        law_tool_called = False
 
         print("🚀 [Agentic] 正在启动 LangGraph 状态机流转...")
 
@@ -246,7 +252,7 @@ class AgenticRAGService:
             ]
 
         async def _consume_graph(state: dict):
-            nonlocal full_answer, final_sources, final_risk, last_sources_payload, last_risk_payload
+            nonlocal full_answer, final_sources, final_risk, last_sources_payload, last_risk_payload, law_tool_called
             async for event in self.workflow_manager.graph.astream_events(state, version="v2"):
                 kind = event["event"]
                 name = event.get("name", "")
@@ -289,6 +295,8 @@ class AgenticRAGService:
                 # 2. 工具执行完毕拦截
                 elif kind == "on_tool_end":
                     print(f"🛠️[工具完成] 工具 {name} 顺利执行完毕")
+                    if str(name or "").strip() == AgentToolNames.LAW_SEARCH:
+                        law_tool_called = True
                     tool_output = event["data"].get("output", "")
                     if isinstance(tool_output, str):
                         try:
@@ -430,6 +438,30 @@ class AgenticRAGService:
                 f"sources={len(final_sources)} | answer_len={len(full_answer)} | "
                 f"history_turns={len(history_entries) // 2}"
             )
+
+            # 专家模式兜底埋点：
+            # 如果本轮没有触发法规检索工具，也写入一条 expert 指标，避免看板出现“专家问答不计数”。
+            if not law_tool_called:
+                law_source_count = len([
+                    src for src in (final_sources or [])
+                    if isinstance(src, dict) and str(src.get("type", "")).strip().lower() == "law"
+                ])
+                self.retrieval_metrics.record(
+                    query=query,
+                    mode="expert",
+                    source="agentic_expert_flow_no_law",
+                    faiss_count=0,
+                    bm25_count=0,
+                    fusion_count=0,
+                    final_count=law_source_count,
+                    threshold_used=0.0,
+                    top_score=0.0,
+                    rerank_fallback=False,
+                    latency_ms=int((time.perf_counter() - request_started) * 1000),
+                    session_id=str(session_id or "default"),
+                    user_id=safe_user_id,
+                    run_id=run_id,
+                )
 
             # 结束处理，更新记忆
             print("💾 [持久化] 正在保存上下文记忆，结束本轮对话流")

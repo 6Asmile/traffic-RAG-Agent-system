@@ -7,6 +7,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.models.agent_run import AgentRun, AgentRunCheckpoint, AgentMemoryRecord
@@ -16,6 +17,9 @@ logger = logging.getLogger(__name__)
 
 class AgentStateStore:
     """基于 Redis 的 Agent 状态存储：长期记忆 + checkpoint。"""
+
+    DB_TABLES_READY = False
+    DB_STATE_JSON_MAX_BYTES = 60000  # 兼容 MySQL TEXT 上限，避免 checkpoint 过大写入失败
 
     MEMORY_KEY = "agentic:memory:{user_id}"
     RUN_KEY = "agentic:run:{run_id}"
@@ -51,9 +55,48 @@ class AgentStateStore:
             AgentRun.__table__.create(bind=bind, checkfirst=True)
             AgentRunCheckpoint.__table__.create(bind=bind, checkfirst=True)
             AgentMemoryRecord.__table__.create(bind=bind, checkfirst=True)
+            self._ensure_checkpoint_state_column_capacity()
             AgentStateStore.DB_TABLES_READY = True
         except Exception as e:
             logger.warning(f"AgentStateStore 初始化数据库表失败: {e}")
+
+    def _ensure_checkpoint_state_column_capacity(self):
+        if not self.db:
+            return
+        try:
+            dialect_name = str(getattr(self.db.bind, "dialect", None).name or "").lower()
+            if dialect_name != "mysql":
+                return
+
+            row = self.db.execute(
+                text(
+                    """
+                    SELECT DATA_TYPE
+                    FROM INFORMATION_SCHEMA.COLUMNS
+                    WHERE TABLE_SCHEMA = DATABASE()
+                      AND TABLE_NAME = 'agent_run_checkpoints'
+                      AND COLUMN_NAME = 'state_json'
+                    LIMIT 1
+                    """
+                )
+            ).first()
+            data_type = str(row[0] if row else "").lower()
+            if data_type and data_type not in {"longtext", "mediumtext"}:
+                self.db.execute(
+                    text(
+                        """
+                        ALTER TABLE agent_run_checkpoints
+                        MODIFY COLUMN state_json LONGTEXT NOT NULL
+                        """
+                    )
+                )
+                self.db.commit()
+                logger.warning(
+                    "AgentStateStore 检测到 state_json 列容量偏小，已自动升级为 LONGTEXT"
+                )
+        except Exception as e:
+            self.db.rollback()
+            logger.warning(f"AgentStateStore 自动升级 state_json 列失败: {e}")
 
     @staticmethod
     def create_run_id(session_id: str) -> str:
@@ -214,7 +257,12 @@ class AgentStateStore:
         return cls._truncate_text(value, 320)
 
     @classmethod
-    def _compact_state_for_checkpoint(cls, state: dict, aggressive: bool = False) -> dict:
+    def _compact_state_for_checkpoint(
+        cls,
+        state: dict,
+        aggressive: bool = False,
+        max_bytes: Optional[int] = None,
+    ) -> dict:
         if not isinstance(state, dict):
             return {}
 
@@ -287,23 +335,26 @@ class AgentStateStore:
                 if str(step or "").strip()
             ],
         }
+        safe_max_bytes = max(int(max_bytes or cls.DB_STATE_JSON_MAX_BYTES), 1024)
         compacted["checkpoint_meta"] = {
             "compacted": True,
             "aggressive": aggressive,
-            "max_bytes": cls.DB_STATE_JSON_MAX_BYTES,
+            "max_bytes": safe_max_bytes,
         }
         return compacted
 
     @classmethod
-    def _serialize_checkpoint_state(cls, state: dict) -> str:
-        compacted = cls._compact_state_for_checkpoint(state, aggressive=False)
+    def _serialize_checkpoint_state(cls, state: dict, max_bytes: Optional[int] = None) -> str:
+        safe_max_bytes = max(int(max_bytes or cls.DB_STATE_JSON_MAX_BYTES), 1024)
+
+        compacted = cls._compact_state_for_checkpoint(state, aggressive=False, max_bytes=safe_max_bytes)
         payload = json.dumps(compacted, ensure_ascii=False)
-        if len(payload.encode("utf-8")) <= cls.DB_STATE_JSON_MAX_BYTES:
+        if len(payload.encode("utf-8")) <= safe_max_bytes:
             return payload
 
-        compacted = cls._compact_state_for_checkpoint(state, aggressive=True)
+        compacted = cls._compact_state_for_checkpoint(state, aggressive=True, max_bytes=safe_max_bytes)
         payload = json.dumps(compacted, ensure_ascii=False)
-        if len(payload.encode("utf-8")) <= cls.DB_STATE_JSON_MAX_BYTES:
+        if len(payload.encode("utf-8")) <= safe_max_bytes:
             return payload
 
         minimal = {
@@ -330,12 +381,12 @@ class AgentStateStore:
                 "compacted": True,
                 "aggressive": True,
                 "fallback_minimal": True,
-                "max_bytes": cls.DB_STATE_JSON_MAX_BYTES,
+                "max_bytes": safe_max_bytes,
             },
         }
         payload = json.dumps(minimal, ensure_ascii=False)
         payload_bytes = payload.encode("utf-8")
-        if len(payload_bytes) <= cls.DB_STATE_JSON_MAX_BYTES:
+        if len(payload_bytes) <= safe_max_bytes:
             return payload
 
         ultra_minimal = {
@@ -347,7 +398,7 @@ class AgentStateStore:
                 "aggressive": True,
                 "fallback_minimal": True,
                 "truncated": True,
-                "max_bytes": cls.DB_STATE_JSON_MAX_BYTES,
+                "max_bytes": safe_max_bytes,
             },
         }
         return json.dumps(ultra_minimal, ensure_ascii=False)
@@ -373,6 +424,11 @@ class AgentStateStore:
             return json.loads(raw)
         except Exception:
             return default
+
+    @staticmethod
+    def _is_state_json_too_long_error(err: Exception) -> bool:
+        raw = str(err or "").lower()
+        return "state_json" in raw and ("data too long" in raw or "1406" in raw)
 
     def start_run(self, run_id: str, user_id: Optional[int | str], session_id: str, query: str):
         safe_user_id = self._safe_user_id(user_id)
@@ -463,9 +519,10 @@ class AgentStateStore:
             self._local_runs[run_id] = prev
 
         if self.db:
-            try:
-                safe_user_id = self._safe_user_id((state or {}).get("user_id"))
-                safe_session_id = str((state or {}).get("session_id") or "default")
+            safe_user_id = self._safe_user_id((state or {}).get("user_id"))
+            safe_session_id = str((state or {}).get("session_id") or "default")
+
+            def _persist_db(state_json_value: str):
                 checkpoint = AgentRunCheckpoint(
                     run_id=run_id,
                     user_id=safe_user_id,
@@ -474,7 +531,7 @@ class AgentStateStore:
                     phase=str(phase or "end"),
                     status=str(status or "running"),
                     error=str(error or ""),
-                    state_json=payload["state_json"],
+                    state_json=state_json_value,
                 )
                 self.db.add(checkpoint)
 
@@ -495,9 +552,30 @@ class AgentStateStore:
                 run.updated_at = datetime.now()
                 run.checkpoint_count = int(run.checkpoint_count or 0) + 1
                 self.db.commit()
+
+            try:
+                _persist_db(payload["state_json"])
             except Exception as e:
                 self.db.rollback()
-                logger.warning(f"save_checkpoint 写入数据库失败: {e}")
+                if self._is_state_json_too_long_error(e):
+                    retry_limits = (8000, 3000)
+                    retry_ok = False
+                    for limit in retry_limits:
+                        try:
+                            fallback_state_json = self._serialize_checkpoint_state(cleaned_state, max_bytes=limit)
+                            _persist_db(fallback_state_json)
+                            retry_ok = True
+                            logger.warning(
+                                f"save_checkpoint state_json 过大，已降级写入（max_bytes={limit}）"
+                            )
+                            break
+                        except Exception as retry_err:
+                            self.db.rollback()
+                            e = retry_err
+                    if not retry_ok:
+                        logger.warning(f"save_checkpoint 降级后仍写入失败: {e}")
+                else:
+                    logger.warning(f"save_checkpoint 写入数据库失败: {e}")
 
     def load_latest_checkpoint(self, run_id: str) -> dict:
         if not run_id:

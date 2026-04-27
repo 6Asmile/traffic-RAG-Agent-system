@@ -1,0 +1,8 @@
+# Test / lint / typing
+pytest==8.3.4
+pytest-asyncio==0.24.0
+ruff==0.7.3
+mypy==1.13.0
+
+# Optional local debugging helpers
+ipython==9.6.0

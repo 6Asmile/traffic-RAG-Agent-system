@@ -3,6 +3,7 @@
 import json
 import re
 import logging
+import time
 from typing import List
 from langchain_core.tools import StructuredTool
 from pydantic import BaseModel, Field
@@ -19,9 +20,19 @@ logger = logging.getLogger(__name__)
 
 class LawSearchInput(BaseModel):
     query: str = Field(description=AgentToolDesc.LAW_SEARCH_QUERY)
+    run_id: str = Field(default="", description="当前 Agent 运行ID")
+    session_id: str = Field(default="default", description="会话ID")
+    user_id: str = Field(default="anonymous", description="用户ID")
+    mode: str = Field(default="expert", description="检索模式")
 
 
-def create_law_search_tool(vector_db, bm25_instance, bm25_corpus: List[str], reranker):
+def create_law_search_tool(
+    vector_db,
+    bm25_instance,
+    bm25_corpus: List[str],
+    reranker,
+    retrieval_metrics_service=None,
+):
     """
     工厂函数：动态创建法规检索工具，实现与外部组件的解耦
     """
@@ -43,9 +54,46 @@ def create_law_search_tool(vector_db, bm25_instance, bm25_corpus: List[str], rer
             "content": text,
         }
 
-    async def search_traffic_law_database(query: str) -> str:
+    async def search_traffic_law_database(
+        query: str,
+        run_id: str = "",
+        session_id: str = "default",
+        user_id: str = "anonymous",
+        mode: str = "expert",
+    ) -> str:
+        started = time.perf_counter()
+        def _record_metric(
+            faiss_count: int,
+            bm25_count: int,
+            fusion_count: int,
+            final_count: int,
+            threshold_used: float,
+            top_score: float,
+            rerank_fallback: bool,
+        ):
+            if not retrieval_metrics_service:
+                return
+            latency_ms = int((time.perf_counter() - started) * 1000)
+            retrieval_metrics_service.record(
+                query=query,
+                mode=str(mode or "expert"),
+                source="agentic_law_tool",
+                faiss_count=faiss_count,
+                bm25_count=bm25_count,
+                fusion_count=fusion_count,
+                final_count=final_count,
+                threshold_used=threshold_used,
+                top_score=top_score,
+                rerank_fallback=rerank_fallback,
+                latency_ms=latency_ms,
+                session_id=session_id,
+                user_id=user_id,
+                run_id=run_id,
+            )
+
         if not vector_db:
             print(f"[召回指标] query='{query[:30]}' | faiss=0 | bm25=0 | merged=0 | final=0 | recall_rate=0.0% | reason=no_vector_db")
+            _record_metric(0, 0, 0, 0, float(RAGToolConfig.SCORE_THRESHOLD), 0.0, False)
             return RAGToolConfig.FALLBACK_MESSAGE
 
         # 1. 并行混合召回 + Weighted RRF 融合
@@ -83,6 +131,7 @@ def create_law_search_tool(vector_db, bm25_instance, bm25_corpus: List[str], rer
                 f"faiss={faiss_count} | bm25={bm25_count} | merged=0 | "
                 f"final=0 | recall_rate=0.0%"
             )
+            _record_metric(faiss_count, bm25_count, 0, 0, float(RAGToolConfig.SCORE_THRESHOLD), 0.0, False)
             return RAGToolConfig.FALLBACK_MESSAGE
 
         # 2. Rerank + 动态阈值过滤（并保证最小保留）
@@ -105,6 +154,7 @@ def create_law_search_tool(vector_db, bm25_instance, bm25_corpus: List[str], rer
                 f"final=0 | recall_rate=0.0% | rerank_filtered_all=True | "
                 f"threshold={threshold_used:.4f}"
             )
+            _record_metric(faiss_count, bm25_count, len(candidate_list), 0, threshold_used, top_score, fallback_rerank)
             return RAGToolConfig.FALLBACK_MESSAGE
 
         # 召回率 = final / merged × 100%
@@ -117,6 +167,15 @@ def create_law_search_tool(vector_db, bm25_instance, bm25_corpus: List[str], rer
             f"final={len(final_docs)} | recall_rate={recall_rate:.1f}% | "
             f"avg_rerank={avg_score:.4f} | top_rerank={top_score:.4f} | "
             f"threshold={threshold_used:.4f} | rerank_fallback={fallback_rerank}"
+        )
+        _record_metric(
+            faiss_count=faiss_count,
+            bm25_count=bm25_count,
+            fusion_count=fusion_count,
+            final_count=len(final_docs),
+            threshold_used=threshold_used,
+            top_score=top_score,
+            rerank_fallback=fallback_rerank,
         )
 
         # 3. 同时返回结构化来源与供模型使用的纯文本
