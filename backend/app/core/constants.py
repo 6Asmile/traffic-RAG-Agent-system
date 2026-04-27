@@ -76,6 +76,22 @@ class AIModelConstants:
     # 文本切片配置
     CHUNK_SIZE = 1200
     CHUNK_OVERLAP = 200
+    # 阿里云 embedding 批大小上限（DashScope 当前限制 <=10）
+    EMBEDDING_BATCH_SIZE = 10
+    # 文档解析最低质量分（低于该分值将标记失败，不进入检索索引）
+    PARSE_MIN_QUALITY_SCORE = 55
+    # PDF 解析最低质量分（PDF 常见字形映射乱码，阈值更严格）
+    PDF_PARSE_MIN_QUALITY_SCORE = 65
+    # 原始文本候选最低分（路由选优用）
+    RAW_TEXT_MIN_ACCEPT_SCORE = 45
+    # 原始文本候选中可接受的最大乱码占比（超过则拒绝该批次）
+    RAW_TEXT_MAX_GARBLED_RATIO = 0.15
+    # PDF 解析批大小（控制内存，避免 OOM）
+    PDF_PARSE_BATCH_SIZE = 5
+    # 超大 PDF 跳过 Docling（仅文本层+OCR），减少峰值内存
+    PDF_DOCLING_MAX_PAGES = 80
+    # 当批次文本候选分低于该值时，触发 OCR 兜底
+    PDF_OCR_TRIGGER_SCORE = 65
 
 
 class RedisKeys:

@@ -1,6 +1,8 @@
 # app/services/rag_service.py
 
 import json
+import html
+import gc
 import logging
 import os
 import re
@@ -46,7 +48,10 @@ from app.services.hybrid_search import (
     parallel_hybrid_retrieve,
     rerank_with_dynamic_threshold,
 )
+from app.services.retrieval_metrics_service import RetrievalMetricsService
 from app.services.tool_service import agent_get_route, agent_search_nearby, agent_get_weather
+from app.services.knowledge_parse_service import KnowledgeParseService
+from app.services.standard_pdf_parser import StandardPdfParser
 
 os.environ["ANONYMIZED_TELEMETRY"] = "False"
 logger = logging.getLogger("RAGService")
@@ -61,9 +66,10 @@ class AliyunEmbeddingWrapper(Embeddings):
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
         results = []
         limits = httpx.Limits(max_keepalive_connections=5, max_connections=10)
+        batch_size = max(1, min(int(getattr(AIModelConstants, "EMBEDDING_BATCH_SIZE", 10)), 10))
         with httpx.Client(timeout=120.0, limits=limits) as client:
-            for i in range(0, len(texts), 15):
-                batch = [str(t) for t in texts[i: i + 15]]
+            for i in range(0, len(texts), batch_size):
+                batch = [str(t) for t in texts[i: i + batch_size]]
                 payload = {"model": self.model, "input": batch}
                 headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
 
@@ -165,6 +171,7 @@ class RAGService:
         self.bm25_instance = None
         self.bm25_corpus = []
         self._init_bm25()
+        self.retrieval_metrics = RetrievalMetricsService(self.db)
 
     def _build_memory_keys(self, session_id: str) -> tuple[str, str]:
         history_key = build_scoped_redis_key(RedisKeys.CHAT_HISTORY, session_id, self.current_user_id)
@@ -292,86 +299,467 @@ class RAGService:
             "rerank_fallback": bool(rerank.get("fallback", False)),
         }
 
-    def _process_document_advanced(self, file_path: str, ext: str) -> list:
-        print(f"👁️ [解析路由] 启动文档解析: {file_path} (格式: {ext})")
-        md_text = ""
+    @staticmethod
+    def _clean_common_noise(text: str) -> str:
+        cleaned = html.unescape(str(text or ""))
+        cleaned = re.sub(r"[\x00-\x08\x0b-\x0c\x0e-\x1f\x7f]", "", cleaned)
+        cleaned = re.sub(r"&lt;unknown&gt;", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"<!--\s*image\s*-->", "", cleaned, flags=re.IGNORECASE)
+        # 修复 PDF 中常见的数字-单位、字母-斜杠断裂
+        cleaned = re.sub(r"(?<=\d)\s+(?=[A-Za-z])", "", cleaned)
+        cleaned = re.sub(r"(?<=[A-Za-z])\s+(?=/)", "", cleaned)
+        cleaned = re.sub(r"(?<=/)\s+(?=[A-Za-z])", "", cleaned)
+        cleaned = re.sub(r"(?<=[A-Za-z])\s+(?=[A-Za-z]/)", "", cleaned)
+        cleaned = re.sub(r"[ \t]+", " ", cleaned)
+        return cleaned.strip()
 
-        if ext == 'pdf':
-            from docling.document_converter import DocumentConverter
-            converter = DocumentConverter()
+    @staticmethod
+    def _stitch_cross_page_lines(text: str) -> str:
+        if not text:
+            return ""
+        normalized = str(text)
+        # 删除常见页眉页脚痕迹
+        normalized = re.sub(r"^\s*第?\s*\d+\s*页\s*$", "", normalized, flags=re.MULTILINE)
+        normalized = re.sub(r"\n{3,}", "\n\n", normalized)
+        # 跨页断句拼接：前一行非句末标点，后一行非标题/列表时拼接
+        normalized = re.sub(r"([^。！？；：:;!?>\]\)])\n+([^\n#\-\*\|])", r"\1\2", normalized)
+        return normalized.strip()
 
-            reader = PdfReader(file_path)
-            total_pages = len(reader.pages)
-            batch_size = 5
+    @staticmethod
+    def _score_raw_text_candidate(text: str) -> dict:
+        raw = str(text or "")
+        compact = re.sub(r"\s+", "", raw)
+        total = len(compact)
+        if total <= 0:
+            return {
+                "score": 0.0,
+                "total_chars": 0,
+                "keyword_hits": 0,
+                "glyph_code_hits": 0,
+                "garbled_ratio": 1.0,
+            }
 
-            print(f"📄 PDF 共 {total_pages} 页，将分 {(total_pages // batch_size) + 1} 批进行解析...")
+        cjk_chars = len(re.findall(r"[\u4e00-\u9fff]", compact))
+        cjk_ratio = cjk_chars / max(total, 1)
+        glyph_code_hits = len(re.findall(r"/G\d{1,4}", raw))
+        cmap_glyph_hits = len(re.findall(r"(?:CID\+\d{2,6}|uni[0-9A-Fa-f]{4,6})", raw))
+        unknown_hits = len(re.findall(r"(?:<unknown>|&lt;unknown&gt;|�)", raw, flags=re.IGNORECASE))
+        split_digits_hits = len(re.findall(r"(?:\d\s+){5,}\d", raw))
+        noisy_symbol_hits = len(re.findall(r"[|/_\-]{5,}", raw))
 
-            for i in range(0, total_pages, batch_size):
-                writer = PdfWriter()
-                for j in range(i, min(i + batch_size, total_pages)):
-                    writer.add_page(reader.pages[j])
+        keywords = [
+            "道路", "交通", "标志", "标线", "速度", "限速", "规定", "标准", "应当", "不得",
+            "机动车", "车道", "驾驶", "处罚", "条", "款", "章", "附录", "GB", "km/h",
+        ]
+        keyword_hits = sum(1 for kw in keywords if kw in raw)
 
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-                    writer.write(tmp.name)
-                    tmp_path = tmp.name
+        score = 100.0
+        if total < 120:
+            score -= 35.0
+        score -= min(glyph_code_hits * 1.8, 55.0)
+        score -= min(cmap_glyph_hits * 1.5, 35.0)
+        score -= min(unknown_hits * 3.0, 30.0)
+        score -= min(split_digits_hits * 12.0, 24.0)
+        score -= min(noisy_symbol_hits * 4.0, 20.0)
+        if total > 500 and keyword_hits < 2:
+            score -= 25.0
+        if cjk_ratio < 0.08 and keyword_hits < 1:
+            score -= 20.0
 
-                try:
-                    result = converter.convert(tmp_path)
-                    md_text += result.document.export_to_markdown() + "\n\n"
-                    print(f"   ⏳ 进度：已解析 {min(i + batch_size, total_pages)} / {total_pages} 页")
-                finally:
-                    if os.path.exists(tmp_path): os.remove(tmp_path)
-             # 去除因为物理分页导致的一句话被切断的现象 (结尾没有句号等标点，直接跟着换行)
-            md_text = re.sub(r'([^\.。：:；;!！?？>])\n+([^\n#*-])', r'\1\2', md_text)
-        elif ext == 'txt':
-            print("📄 检测到 TXT 文件，采用极速纯文本读取...")
+        garbled_signal = (
+            glyph_code_hits * 4
+            + cmap_glyph_hits * 3
+            + unknown_hits * 6
+            + split_digits_hits * 10
+            + noisy_symbol_hits * 3
+        )
+        garbled_ratio = min(float(garbled_signal) / max(total, 1), 1.0)
+        score = max(min(score, 100.0), 0.0)
+
+        return {
+            "score": round(score, 2),
+            "total_chars": total,
+            "cjk_ratio": round(cjk_ratio, 4),
+            "keyword_hits": int(keyword_hits),
+            "glyph_code_hits": int(glyph_code_hits),
+            "cmap_glyph_hits": int(cmap_glyph_hits),
+            "unknown_hits": int(unknown_hits),
+            "split_digits_hits": int(split_digits_hits),
+            "noisy_symbol_hits": int(noisy_symbol_hits),
+            "garbled_ratio": round(garbled_ratio, 4),
+        }
+
+    def _extract_pdf_docling_markdown_batched(
+        self,
+        file_path: str,
+        batch_size: int = 5,
+        return_parts: bool = False,
+    ) -> tuple[object, int]:
+        converter = DocumentConverter()
+        reader = PdfReader(file_path)
+        total_pages = len(reader.pages)
+
+        print(f"📄 PDF 共 {total_pages} 页，Docling 分批解析中...")
+        markdown_parts = []
+        for i in range(0, total_pages, batch_size):
+            writer = PdfWriter()
+            for j in range(i, min(i + batch_size, total_pages)):
+                writer.add_page(reader.pages[j])
+
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                writer.write(tmp.name)
+                tmp_path = tmp.name
+
             try:
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    md_text = f.read()
+                result = converter.convert(tmp_path)
+                markdown_parts.append(result.document.export_to_markdown())
+                print(f"   ⏳ 进度：已解析 {min(i + batch_size, total_pages)} / {total_pages} 页")
+                del result
+                gc.collect()
+            finally:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+
+        if return_parts:
+            return markdown_parts, total_pages
+        return "\n\n".join(markdown_parts), total_pages
+
+    def _split_semantic_units(self, text: str, metadata: dict | None = None) -> list[tuple[str, dict]]:
+        raw = str(text or "").strip()
+        if not raw:
+            return []
+
+        safe_metadata = dict(metadata or {})
+        if len(raw) <= AIModelConstants.CHUNK_SIZE:
+            return [(raw, safe_metadata)]
+
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=AIModelConstants.CHUNK_SIZE,
+            chunk_overlap=AIModelConstants.CHUNK_OVERLAP,
+            separators=["\n\n", "\n", "。", "；", "，", " "],
+            length_function=len,
+        )
+        pieces = []
+        for piece in splitter.split_text(raw):
+            normalized = str(piece or "").strip()
+            if normalized:
+                pieces.append((normalized, dict(safe_metadata)))
+        return pieces
+
+    @staticmethod
+    def _is_table_chunk(text: str) -> bool:
+        raw = str(text or "")
+        if re.search(r"\|.+\|", raw) and re.search(r"\|\s*-{2,}\s*\|", raw):
+            return True
+        lines = [line for line in raw.splitlines() if "|" in line]
+        return len(lines) >= 3
+
+    @staticmethod
+    def _classify_chunk_role(text: str) -> str:
+        raw = str(text or "").strip()
+        if not raw:
+            return "empty"
+        if re.match(r"^第[一二三四五六七八九十百千万0-9]+章\b", raw):
+            return "chapter_heading"
+        if re.match(r"^第[一二三四五六七八九十百千万0-9]+节\b", raw):
+            return "section_heading"
+        if re.match(r"^第[一二三四五六七八九十百千万0-9]+条\b", raw):
+            return "article_heading"
+        if re.match(r"^附录\s*[A-ZＡ-Ｚ一二三四五六七八九十]?\b", raw):
+            return "appendix_heading"
+        if re.match(r"^表\s*[0-9A-Za-z一二三四五六七八九十\.\-]+", raw):
+            return "table_caption"
+        if re.match(r"^图\s*[0-9A-Za-z一二三四五六七八九十\.\-]+", raw):
+            return "figure_caption"
+        return "body"
+
+    @staticmethod
+    def _should_keep_short_chunk(text: str, role: str) -> bool:
+        raw = str(text or "").strip()
+        if not raw:
+            return False
+        if role in {
+            "chapter_heading",
+            "section_heading",
+            "article_heading",
+            "appendix_heading",
+            "table_caption",
+            "figure_caption",
+        }:
+            return True
+        return False
+
+    @staticmethod
+    def _is_garbled_chunk(text: str) -> bool:
+        raw = str(text or "")
+        if not raw.strip():
+            return True
+        if "�" in raw or re.search(r"(?:<unknown>|&lt;unknown&gt;)", raw, flags=re.IGNORECASE):
+            return True
+        if re.search(r"/G\d{1,4}", raw):
+            return True
+        if re.search(r"(?:\d\s+){5,}\d", raw):
+            return True
+        if re.search(r"(?:CID\+\d{2,6}|uni[0-9A-Fa-f]{4,6})", raw):
+            return True
+        compact = re.sub(r"\s+", "", raw)
+        if not compact:
+            return True
+        cjk_chars = len(re.findall(r"[\u4e00-\u9fff]", compact))
+        cjk_ratio = cjk_chars / max(len(compact), 1)
+        if len(compact) >= 120 and cjk_ratio < 0.03:
+            return True
+        noisy = len(re.findall(r"[|/_\-]", compact))
+        noisy_ratio = noisy / max(len(compact), 1)
+        if noisy_ratio > 0.18:
+            return True
+        return False
+
+    def _compute_parse_quality(
+        self,
+        chunks: list[str],
+        chunk_types: list[str],
+        raw_text: str,
+        chunk_roles: list[str] | None = None,
+    ) -> dict:
+        total = len(chunks)
+        if total <= 0:
+            return {
+                "quality_score": 0.0,
+                "empty_chunk_rate": 1.0,
+                "garbled_chunk_rate": 1.0,
+                "short_chunk_rate": 1.0,
+                "table_chunk_rate": 0.0,
+                "total_chunks": 0,
+            }
+
+        empty_count = 0
+        garbled_count = 0
+        short_count = 0
+        table_count = 0
+
+        for idx, chunk in enumerate(chunks):
+            text = str(chunk or "").strip()
+            if not text:
+                empty_count += 1
+                continue
+            role = str(chunk_roles[idx]) if chunk_roles and idx < len(chunk_roles) else "body"
+            if len(text) < 80 and not self._should_keep_short_chunk(text, role):
+                short_count += 1
+            if self._is_garbled_chunk(text):
+                garbled_count += 1
+            if idx < len(chunk_types) and str(chunk_types[idx]) == "table":
+                table_count += 1
+
+        empty_rate = round(empty_count / total, 6)
+        garbled_rate = round(garbled_count / total, 6)
+        short_rate = round(short_count / total, 6)
+        table_rate = round(table_count / total, 6)
+
+        # 质量总分：惩罚空块/乱码/超短块，表格识别略加分
+        score = 100.0
+        score -= empty_rate * 55.0
+        score -= garbled_rate * 30.0
+        score -= short_rate * 20.0
+        score += min(table_rate * 8.0, 5.0)
+        score = max(min(score, 100.0), 0.0)
+
+        return {
+            "quality_score": round(score, 2),
+            "empty_chunk_rate": empty_rate,
+            "garbled_chunk_rate": garbled_rate,
+            "short_chunk_rate": short_rate,
+            "table_chunk_rate": table_rate,
+            "total_chunks": total,
+            "table_chunk_count": table_count,
+            "raw_text_chars": len(str(raw_text or "")),
+        }
+
+    def _route_and_extract_document(self, file_path: str, ext: str) -> tuple[str, dict]:
+        safe_ext = str(ext or "").strip().lower()
+        parse_meta = {
+            "ext": safe_ext,
+            "route": "unknown",
+            "is_scanned_pdf": False,
+            "ocr_used": False,
+            "ocr_reason": "",
+            "total_pages": 0,
+        }
+
+        if safe_ext == "txt":
+            print("📄 检测到 TXT 文件，采用纯文本解析...")
+            try:
+                with open(file_path, "r", encoding="utf-8") as f:
+                    text = f.read()
             except UnicodeDecodeError:
-                with open(file_path, 'r', encoding='gbk') as f:
-                    md_text = f.read()
-        else:
-            from docling.document_converter import DocumentConverter
+                with open(file_path, "r", encoding="gbk") as f:
+                    text = f.read()
+            parse_meta["route"] = "txt_plain"
+            return text, parse_meta
+
+        if safe_ext == "pdf":
+            if StandardPdfParser.looks_like_standard_pdf(file_path):
+                batch_size = max(int(getattr(AIModelConstants, "PDF_PARSE_BATCH_SIZE", 4)), 1)
+                normalized_markdown, standard_meta = StandardPdfParser.parse_docling_batched(
+                    file_path=file_path,
+                    batch_size=batch_size,
+                )
+                parse_meta.update(standard_meta)
+                return normalized_markdown, parse_meta
+
+            batch_size = max(int(getattr(AIModelConstants, "PDF_PARSE_BATCH_SIZE", 4)), 1)
+            try:
+                docling_markdown, total_pages = self._extract_pdf_docling_markdown_batched(
+                    file_path,
+                    batch_size=batch_size,
+                    return_parts=False,
+                )
+            except Exception as e:
+                raise ValueError(f"Docling 分页解析失败: {str(e)}") from e
+
+            parse_meta["total_pages"] = int(total_pages or 0)
+            parse_meta["batch_size"] = int(batch_size)
+            parse_meta["route"] = "pdf_docling_batched_markdown"
+            parse_meta["ocr_reason"] = "docling_builtin"
+            parse_meta["ocr_used"] = False
+
+            merged_text = str(docling_markdown or "").strip()
+            if not merged_text:
+                raise ValueError("Docling 解析成功但未产出可用 markdown 内容")
+
+            return merged_text, parse_meta
+
+        try:
             converter = DocumentConverter()
             result = converter.convert(file_path)
             md_text = result.document.export_to_markdown()
+            parse_meta["route"] = f"{safe_ext}_docling"
+            return md_text, parse_meta
+        except Exception as e:
+            parse_meta["docling_error"] = str(e)[:300]
+            if safe_ext in {"md", "markdown"}:
+                with open(file_path, "r", encoding="utf-8") as f:
+                    text = f.read()
+                parse_meta["route"] = "markdown_plain_fallback"
+                return text, parse_meta
+            raise
+
+    def _process_document_advanced(self, file_path: str, ext: str) -> dict:
+        print(f"👁️ [解析路由] 启动文档解析: {file_path} (格式: {ext})")
+        raw_text, parse_meta = self._route_and_extract_document(file_path, ext)
+
+        md_text = self._clean_common_noise(raw_text)
+        md_text = self._stitch_cross_page_lines(md_text)
 
         headers_to_split_on = [("#", "章"), ("##", "节"), ("###", "条"), ("####", "款")]
         md_splitter = MarkdownHeaderTextSplitter(headers_to_split_on=headers_to_split_on, strip_headers=False)
-        md_splits = md_splitter.split_text(md_text)
+        try:
+            md_splits = md_splitter.split_text(md_text)
+        except Exception:
+            md_splits = []
 
-        # 使用常量替换硬编码切片参数
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=AIModelConstants.CHUNK_SIZE,
-                                                       chunk_overlap=AIModelConstants.CHUNK_OVERLAP)
-        final_splits = text_splitter.split_documents(md_splits)
+        split_units = []
+        if md_splits:
+            for split in md_splits:
+                split_units.append((str(split.page_content or ""), dict(split.metadata or {})))
+        else:
+            split_units.append((md_text, {}))
 
-        valid_texts = []
-        for split in final_splits:
-            hierarchy = [split.metadata[h] for h in ["章", "节", "条", "款"] if h in split.metadata]
+        valid_texts: list[str] = []
+        chunk_types: list[str] = []
+        chunk_roles: list[str] = []
+        dropped_garbled_chunks = 0
+
+        for page_content, metadata in split_units:
+            hierarchy = [metadata[h] for h in ["章", "节", "条", "款"] if h in metadata and str(metadata[h]).strip()]
             path_str = " > ".join(hierarchy) if hierarchy else "通用正文"
+            if "目 次" in path_str:
+                continue
 
-            content = split.page_content.strip()
-            if "目 次" in path_str or "........" in content: continue
-            content = re.sub(r'[\x00-\x08\x0b-\x0c\x0e-\x1f\x7f]', '', content)
+            semantic_units = self._split_semantic_units(page_content, metadata)
+            for content, _ in semantic_units:
+                normalized = self._clean_common_noise(content)
+                chunk_role = self._classify_chunk_role(normalized)
+                if len(normalized) < 15 and not self._should_keep_short_chunk(normalized, chunk_role):
+                    continue
+                if self._is_garbled_chunk(normalized):
+                    dropped_garbled_chunks += 1
+                    continue
 
-            if len(content) < 15: continue
+                clause_match = re.search(r"第[\u4e00-\u9fa5\d]+条", normalized)
+                clause_num = clause_match.group() if clause_match else "明细条款"
+                chunk_type = "table" if self._is_table_chunk(normalized) else "text"
 
-            clause_match = re.search(r'第[\u4e00-\u9fa5\d]+条', content)
-            clause_num = clause_match.group() if clause_match else "明细条款"
+                enriched_text = f"【章节】: {path_str} | 【{clause_num}】\n{normalized}"
+                valid_texts.append(enriched_text)
+                chunk_types.append(chunk_type)
+                chunk_roles.append(chunk_role)
 
-            enriched_text = f"【章节】: {path_str} | 【{clause_num}】\n{content}"
-            valid_texts.append(enriched_text)
+        quality_metrics = self._compute_parse_quality(valid_texts, chunk_types, md_text, chunk_roles)
+        parse_meta = {
+            **(parse_meta or {}),
+            "pipeline": "modern_rag_parse_v2",
+            "dropped_garbled_chunks": int(dropped_garbled_chunks),
+            "chunk_type_counts": {
+                "text": int(sum(1 for x in chunk_types if x == "text")),
+                "table": int(sum(1 for x in chunk_types if x == "table")),
+            },
+            "chunk_role_counts": {
+                "chapter_heading": int(sum(1 for x in chunk_roles if x == "chapter_heading")),
+                "section_heading": int(sum(1 for x in chunk_roles if x == "section_heading")),
+                "article_heading": int(sum(1 for x in chunk_roles if x == "article_heading")),
+                "appendix_heading": int(sum(1 for x in chunk_roles if x == "appendix_heading")),
+                "table_caption": int(sum(1 for x in chunk_roles if x == "table_caption")),
+                "figure_caption": int(sum(1 for x in chunk_roles if x == "figure_caption")),
+                "body": int(sum(1 for x in chunk_roles if x == "body")),
+            },
+        }
 
-        print(f"✅[解析完成] 共提取 {len(valid_texts)} 个语义富化块。")
-        return valid_texts
+        min_quality = float(getattr(AIModelConstants, "PARSE_MIN_QUALITY_SCORE", 55))
+        if str(parse_meta.get("ext", "")).lower() == "pdf":
+            min_quality = max(
+                min_quality,
+                float(getattr(AIModelConstants, "PDF_PARSE_MIN_QUALITY_SCORE", min_quality)),
+            )
+        if (
+            int(quality_metrics.get("total_chunks", 0) or 0) >= 5
+            and float(quality_metrics.get("quality_score", 0.0) or 0.0) < min_quality
+        ):
+            raise ValueError(
+                f"解析质量过低（score={quality_metrics.get('quality_score')} < {min_quality}），已拒绝入库以避免污染检索"
+            )
+        if (
+            str(parse_meta.get("ext", "")).lower() == "pdf"
+            and int(quality_metrics.get("total_chunks", 0) or 0) >= 5
+            and float(quality_metrics.get("garbled_chunk_rate", 0.0) or 0.0) > 0.25
+        ):
+            raise ValueError(
+                f"PDF 乱码块占比过高（garbled_rate={quality_metrics.get('garbled_chunk_rate')}），已拒绝入库"
+            )
+
+        print(f"✅[解析完成] route={parse_meta.get('route')} | chunks={len(valid_texts)}")
+        return {
+            "chunks": valid_texts,
+            "quality_metrics": quality_metrics,
+            "parse_meta": parse_meta,
+        }
 
     def async_process_and_store(self, file_path: str, ext: str, doc_id: int):
         db = SessionLocal()
+        parse_service = KnowledgeParseService(db)
         try:
-            valid_texts = self._process_document_advanced(file_path, ext)
+            parse_service.mark_processing(
+                doc_id=doc_id,
+                parse_meta={"ext": ext, "pipeline": "modern_rag_parse_v2", "async": True},
+            )
+
+            parse_result = self._process_document_advanced(file_path, ext)
+            valid_texts = list(parse_result.get("chunks", []) or [])
+            quality_metrics = dict(parse_result.get("quality_metrics", {}) or {})
+            parse_meta = dict(parse_result.get("parse_meta", {}) or {})
             if not valid_texts:
                 logger.warning(f"文档 {doc_id} 未提取到有效文本")
+                parse_service.mark_failed(doc_id=doc_id, error="未提取到有效文本", parse_meta=parse_meta)
                 return
 
             if self.vector_db is None:
@@ -389,9 +777,19 @@ class RAGService:
                 doc.chunk_count = len(valid_texts)
                 doc.parsed_content = valid_texts
                 db.commit()
+                parse_service.mark_ready(doc_id=doc_id, quality_metrics=quality_metrics, parse_meta=parse_meta)
                 logger.info(f"🎉 异步任务完成！文档ID:{doc_id} 已成功存入 {len(valid_texts)} 个切片。")
         except Exception as e:
             logger.error(f"❌ 异步解析任务崩溃: {e}")
+            parse_service.mark_failed(doc_id=doc_id, error=str(e), parse_meta={"ext": ext, "async": True})
+            try:
+                failed_doc = db.query(KnowledgeDoc).filter_by(id=doc_id).first()
+                if failed_doc:
+                    failed_doc.chunk_count = 0
+                    failed_doc.parsed_content = []
+                    db.commit()
+            except Exception:
+                db.rollback()
         finally:
             db.close()
 
@@ -407,7 +805,8 @@ class RAGService:
 
         try:
             ext = filename.split('.')[-1].lower()
-            valid_texts = self._process_document_advanced(file_save_path, ext)
+            parse_result = self._process_document_advanced(file_save_path, ext)
+            valid_texts = list(parse_result.get("chunks", []) or [])
         except Exception as e:
             logger.error(f"文档解析失败: {e}")
             raise Exception(f"文档解析失败: {str(e)}")
@@ -556,7 +955,9 @@ class RAGService:
 
         # 4. 混合检索
         print("📡 [混合检索] 执行中...")
+        retrieval_started = time.perf_counter()
         hybrid_result = await self.retrieve_hybrid_docs(search_query, mode="fast")
+        retrieval_latency_ms = int((time.perf_counter() - retrieval_started) * 1000)
         faiss_docs = hybrid_result.get("faiss_docs", [])
         bm25_docs = hybrid_result.get("bm25_docs", [])
         candidate_list = hybrid_result.get("fused_docs", [])
@@ -570,7 +971,23 @@ class RAGService:
             f"faiss={len(faiss_docs)} | bm25={len(bm25_docs)} | "
             f"fusion={len(candidate_list)} | final={len(final_docs)} | "
             f"threshold={threshold_used:.4f} | top_rerank={top_score:.4f} | "
-            f"rerank_fallback={rerank_fallback}"
+            f"rerank_fallback={rerank_fallback} | latency_ms={retrieval_latency_ms}"
+        )
+        self.retrieval_metrics.record(
+            query=search_query,
+            mode="fast",
+            source="chat_fast_retrieval",
+            faiss_count=len(faiss_docs),
+            bm25_count=len(bm25_docs),
+            fusion_count=len(candidate_list),
+            final_count=len(final_docs),
+            threshold_used=threshold_used,
+            top_score=top_score,
+            rerank_fallback=rerank_fallback,
+            latency_ms=retrieval_latency_ms,
+            session_id=session_id,
+            user_id=self.current_user_id,
+            run_id="",
         )
 
         if not final_docs:

@@ -20,6 +20,7 @@ from app.models import ChatSession, ChatMessage, User, HotTopic, AIConfig
 from app.models.knowledge import KnowledgeDoc
 from app.services.analytics_service import AnalyticsService
 from app.services.graph_service import GraphService
+from app.services.knowledge_parse_service import KnowledgeParseService
 from app.services.rag_service import RAGService
 from app.core.security import SECRET_KEY, ALGORITHM, verify_password, get_password_hash
 from pydantic import BaseModel
@@ -262,6 +263,10 @@ async def upload_knowledge_file(
         db.add(new_doc)
         db.commit()
         db.refresh(new_doc)
+        KnowledgeParseService(db).mark_processing(
+            doc_id=new_doc.id,
+            parse_meta={"source_ext": ext, "pipeline": "modern_rag_parse"},
+        )
 
         # 3. 将解析任务推入后台队列！
         background_tasks.add_task(service.async_process_and_store, file_save_path, ext, new_doc.id)
@@ -347,8 +352,29 @@ async def perform_analysis(
 @router.get("/knowledge_graph")
 def get_graph(db: Session = Depends(get_db)):
     """获取图谱数据"""
-    gs = GraphService(None) # 仅查询不需要LLM
-    return gs.get_full_graph(db)
+    gs = GraphService(None)  # 仅查询不需要LLM
+    graph_data = gs.get_full_graph(db)
+
+    nodes = graph_data.get("nodes") if isinstance(graph_data, dict) else []
+    links = graph_data.get("links") if isinstance(graph_data, dict) else []
+    safe_nodes = nodes if isinstance(nodes, list) else []
+    safe_links = links if isinstance(links, list) else []
+
+    message = ""
+    if len(safe_nodes) == 0:
+        ready_docs = db.query(KnowledgeDoc.id).filter(KnowledgeDoc.chunk_count > 0).count()
+        if ready_docs <= 0:
+            message = "暂无可用知识切片，请先上传并完成文档解析。"
+        else:
+            message = f"已有 {ready_docs} 篇已解析文档，但图谱尚未构建，请点击“从知识库扩展图谱”。"
+
+    return {
+        "nodes": safe_nodes,
+        "links": safe_links,
+        "node_count": len(safe_nodes),
+        "link_count": len(safe_links),
+        "message": message,
+    }
 
 # 在 build_graph 内部定义一个后台任务处理函数
 async def run_graph_build(texts: list):
@@ -403,17 +429,27 @@ async def build_graph(
     if not all_chunks:
         return {"status": "error", "message": "知识库为空，暂无可用数据构建图谱"}
 
-    # 为防止大模型 API 耗时过长或 Token 爆炸，采用增量抽取策略
-    # 使用常量限制每次抽取的样本数 (例如 15 个切片)
-    sample_size = min(len(all_chunks), GraphConstants.EXTRACT_CHUNK_LIMIT)
-    texts = random.sample(all_chunks, sample_size)
+    valid_chunks = [
+        str(chunk).strip()
+        for chunk in all_chunks
+        if isinstance(chunk, str) and len(str(chunk).strip()) >= GraphConstants.MIN_TEXT_LENGTH
+    ]
+    if not valid_chunks:
+        return {"status": "error", "message": "知识切片过短，暂无可用于构建图谱的有效文本"}
+
+    # 为防止大模型 API 耗时过长或 Token 爆炸，采用“长文本优先 + 随机抽样”策略
+    # 比完全随机更容易抽到结构化法规内容，降低空图概率。
+    sorted_chunks = sorted(valid_chunks, key=len, reverse=True)
+    candidate_pool = sorted_chunks[: min(len(sorted_chunks), GraphConstants.EXTRACT_CHUNK_LIMIT * 8)]
+    sample_size = min(len(candidate_pool), GraphConstants.EXTRACT_CHUNK_LIMIT)
+    texts = random.sample(candidate_pool, sample_size)
 
     # 丢给后台任务慢慢处理
     background_tasks.add_task(run_graph_build, texts)
 
     return {
         "status": "processing",
-        "message": f"图谱更新任务已在后台启动，本次随机抽取了 {sample_size} 个知识切片进行深度分析"
+        "message": f"图谱更新任务已在后台启动，本次抽取了 {sample_size} 个高信息量切片进行分析"
     }
 
 

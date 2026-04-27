@@ -7,4 +7,9 @@ from app.models.analysis import HotTopic
 from .graph import GraphNode, GraphEdge
 from  .quiz import UserQuizRecord,Question
 from .agent_run import AgentRun, AgentRunCheckpoint, AgentMemoryRecord
+from .admin_audit_log import AdminAuditLog
+from .admin_notice_read import AdminNoticeRead
+from .admin_runtime_setting import AdminRuntimeSetting
+from .retrieval_metric import RetrievalMetric
+from .knowledge_parse_report import KnowledgeParseReport
 # 这样以后你再增加新的模型文件（比如 ChatLog），也记得在这里加一行
