@@ -92,10 +92,11 @@ def get_results(
             "retrieved_contexts": r.retrieved_contexts,
             "reference_answer": r.reference_answer,
             "faithfulness": r.faithfulness,
-            "answer_accuracy": r.answer_accuracy,
-            "answer_relevancy": r.answer_relevancy,
+            "factual_correctness": r.factual_correctness,
+            "response_relevancy": r.response_relevancy,
             "context_recall": r.context_recall,
             "avg_score": r.avg_score,
+            "analysis": r.analysis if r.analysis else {},
             "status": r.status,
             "created_at": r.created_at.strftime("%Y-%m-%d %H:%M:%S") if r.created_at else ""
         }

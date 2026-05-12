@@ -126,6 +126,11 @@ const llmModels =[
     name: 'GPT-4o', 
     logo: 'https://upload.wikimedia.org/wikipedia/commons/0/04/ChatGPT_logo.svg' 
   },
+  { 
+    id: 'mimo-v2.5-pro', 
+    name: 'MiMo V2.5 Pro', 
+    logo: 'https://img.icons8.com/3d-fluency/94/artificial-intelligence.png' 
+  },
 ];
 
 const form = ref({

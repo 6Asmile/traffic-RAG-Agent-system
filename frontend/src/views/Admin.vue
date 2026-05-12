@@ -154,11 +154,11 @@
             <div class="score-label">上下文召回率</div>
           </div>
           <div class="score-card">
-            <div class="score-value">{{ formatScore(evalLatest.avg_scores?.answer_accuracy) }}</div>
-            <div class="score-label">答案准确性</div>
+            <div class="score-value">{{ formatScore(evalLatest.avg_scores?.factual_correctness) }}</div>
+            <div class="score-label">事实正确性</div>
           </div>
           <div class="score-card">
-            <div class="score-value">{{ formatScore(evalLatest.avg_scores?.answer_relevancy) }}</div>
+            <div class="score-value">{{ formatScore(evalLatest.avg_scores?.response_relevancy) }}</div>
             <div class="score-label">回答相关性</div>
           </div>
         </div>
@@ -180,14 +180,14 @@
                 <span :class="getScoreClass(scope.row.context_recall)">{{ formatScore(scope.row.context_recall) }}</span>
               </template>
             </el-table-column>
-            <el-table-column prop="answer_accuracy" label="答案准确性" width="100" align="center">
+            <el-table-column prop="factual_correctness" label="事实正确性" width="100" align="center">
               <template #default="scope">
-                <span :class="getScoreClass(scope.row.answer_accuracy)">{{ formatScore(scope.row.answer_accuracy) }}</span>
+                <span :class="getScoreClass(scope.row.factual_correctness)">{{ formatScore(scope.row.factual_correctness) }}</span>
               </template>
             </el-table-column>
-            <el-table-column prop="answer_relevancy" label="回答相关性" width="100" align="center">
+            <el-table-column prop="response_relevancy" label="回答相关性" width="100" align="center">
               <template #default="scope">
-                <span :class="getScoreClass(scope.row.answer_relevancy)">{{ formatScore(scope.row.answer_relevancy) }}</span>
+                <span :class="getScoreClass(scope.row.response_relevancy)">{{ formatScore(scope.row.response_relevancy) }}</span>
               </template>
             </el-table-column>
             <el-table-column prop="avg_score" label="平均分" width="80" align="center">

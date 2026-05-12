@@ -1,9 +1,6 @@
-import json
 import logging
 import math
-import re
 from datetime import datetime
-from typing import List, Optional
 
 from langchain_openai import ChatOpenAI
 from sqlalchemy.orm import Session
@@ -12,61 +9,6 @@ from app.models.evaluation import EvalDataset, EvalResult, EvalRun
 from app.services.config_service import ConfigService
 
 logger = logging.getLogger("EvaluationService")
-
-RETRIEVAL_EVAL_PROMPT = """你是一个专业的RAG系统评估专家，专注于评估检索质量。请对以下问答结果进行评估。
-
-【问题】
-{question}
-
-【系统生成的回答】
-{generated_answer}
-
-【检索到的上下文】
-{retrieved_contexts}
-
-【参考答案】
-{reference_answer}
-
-请从以下两个维度评分（0-10分，整数）：
-
-1. 忠实度(Faithfulness)：系统回答是否完全基于检索到的上下文，有无编造或幻觉？
-   - 10分：完全基于上下文，无任何编造
-   - 5分：部分内容基于上下文，有少量编造
-   - 0分：回答内容完全与上下文无关或大量编造
-
-2. 上下文召回率(Context Recall)：检索到的上下文是否包含了参考答案所需的关键信息？
-   - 10分：上下文包含参考答案所有关键信息
-   - 5分：上下文包含部分关键信息
-   - 0分：上下文完全不包含参考答案的任何信息
-
-请严格按照以下JSON格式返回，不要添加任何其他内容：
-{{"faithfulness": X, "context_recall": X}}"""
-
-ANSWER_EVAL_PROMPT = """你是一个专业的RAG系统评估专家，专注于评估答案质量。请对以下问答结果进行评估。
-
-【问题】
-{question}
-
-【系统生成的回答】
-{generated_answer}
-
-【参考答案】
-{reference_answer}
-
-请从以下两个维度评分（0-10分，整数）：
-
-1. 答案准确性(Answer Accuracy)：系统回答与参考答案在事实层面是否一致？
-   - 10分：与参考答案完全一致
-   - 5分：部分事实一致，有少量偏差
-   - 0分：与参考答案完全矛盾
-
-2. 回答相关性(Answer Relevancy)：系统回答是否直接针对问题，是否切题？
-   - 10分：完全切题，直接回答了问题
-   - 5分：部分切题，但包含无关内容
-   - 0分：完全跑题
-
-请严格按照以下JSON格式返回，不要添加任何其他内容：
-{{"answer_accuracy": X, "answer_relevancy": X}}"""
 
 
 def _safe_float(val):
@@ -81,126 +23,127 @@ def _safe_float(val):
         return None
 
 
-def _parse_llm_json(response_text: str, score_keys: list) -> dict:
-    json_match = re.search(r'\{[^{}]*\}', response_text, re.DOTALL)
-    if not json_match:
-        raise ValueError(f"LLM 回复中未找到 JSON: {response_text[:200]}")
-
-    raw = json.loads(json_match.group())
-
-    scores = {}
-    for key in score_keys:
-        val = raw.get(key)
-        if val is not None:
-            val = float(val)
-            val = max(0.0, min(1.0, val / 10.0))
-        scores[key] = val
-
-    return scores
-
-
 class EvaluationService:
 
     @staticmethod
-    def _get_llm(db: Session):
+    def _build_evaluator_llm(db: Session):
         llm_cfg = ConfigService.get_active_config(db, "llm")
         if not llm_cfg:
             raise Exception("LLM 配置缺失，无法执行评估")
 
-        llm = ChatOpenAI(
+        from ragas.llms import LangchainLLMWrapper
+
+        chat_llm = ChatOpenAI(
             model=llm_cfg.model_name,
             openai_api_key=llm_cfg.api_key,
             openai_api_base=llm_cfg.base_url,
             temperature=0,
             request_timeout=300
         )
-        return llm
+        return LangchainLLMWrapper(chat_llm)
 
     @staticmethod
-    def _evaluate_retrieval(llm, item: dict) -> dict:
-        contexts_str = "\n".join(
-            [f"[资料{i + 1}]: {c}" for i, c in enumerate(item.get("retrieved_contexts", []))]
-        ) if item.get("retrieved_contexts") else "（无检索上下文）"
+    def _build_evaluator_embeddings(db: Session):
+        emb_cfg = ConfigService.get_active_config(db, "embedding")
+        if not emb_cfg:
+            raise Exception("Embedding 配置缺失，无法执行评估")
 
-        prompt = RETRIEVAL_EVAL_PROMPT.format(
-            question=item["user_input"],
-            generated_answer=item["response"],
-            retrieved_contexts=contexts_str,
-            reference_answer=item["reference"]
+        from ragas.embeddings import LangchainEmbeddingsWrapper
+        from app.services.rag_service import AliyunEmbeddingWrapper
+
+        emb = AliyunEmbeddingWrapper(
+            model=emb_cfg.model_name,
+            api_key=emb_cfg.api_key,
+            base_url=emb_cfg.base_url
         )
-
-        response = llm.invoke(prompt).content
-        return _parse_llm_json(response, ["faithfulness", "context_recall"])
+        return LangchainEmbeddingsWrapper(emb)
 
     @staticmethod
-    def _evaluate_answer(llm, item: dict) -> dict:
-        prompt = ANSWER_EVAL_PROMPT.format(
-            question=item["user_input"],
-            generated_answer=item["response"],
-            reference_answer=item["reference"]
-        )
+    def _build_ragas_metrics(evaluator_llm, evaluator_embeddings):
+        from ragas.metrics import LLMContextRecall, Faithfulness, FactualCorrectness, ResponseRelevancy
 
-        response = llm.invoke(prompt).content
-        return _parse_llm_json(response, ["answer_accuracy", "answer_relevancy"])
-
-    @staticmethod
-    def _evaluate_single(llm, item: dict) -> dict:
-        retrieval_scores = EvaluationService._evaluate_retrieval(llm, item)
-        answer_scores = EvaluationService._evaluate_answer(llm, item)
-        return {**retrieval_scores, **answer_scores}
+        return [
+            Faithfulness(llm=evaluator_llm),
+            LLMContextRecall(llm=evaluator_llm),
+            FactualCorrectness(llm=evaluator_llm,mode="recall"),
+            ResponseRelevancy(llm=evaluator_llm, embeddings=evaluator_embeddings),
+        ]
 
     @staticmethod
-    def _collect_rag_outputs_with_rag(query: str, rag) -> dict:
-        search_query = rag.strict_clean(query)
+    def _collect_rag_outputs(datasets, db: Session):
+        from app.services.rag_service import RAGService
+        from app.db.session import SessionLocal
 
-        if not rag.vector_db:
-            return {"answer": "知识库为空", "contexts": []}
-
-        faiss_docs = rag.vector_db.similarity_search(search_query, k=40)
-
-        bm25_docs = []
-        if rag.bm25_instance:
-            import jieba
-            tokenized_query = list(jieba.cut(search_query))
-            scores = rag.bm25_instance.get_scores(tokenized_query)
-            top_n = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:20]
-            from langchain_core.documents import Document
-            bm25_docs = [Document(page_content=rag.bm25_corpus[i]) for i in top_n if scores[i] > 0]
-
-        candidates = {}
-        for d in faiss_docs + bm25_docs:
-            if d.page_content not in candidates:
-                candidates[d.page_content] = d.page_content
-        candidate_list = list(candidates.values())
-
-        final_docs = []
+        rag_db = SessionLocal()
         try:
-            rerank_results = rag.reranker.rerank(search_query, candidate_list, top_n=10)
-            for res in rerank_results:
-                score = res.get('relevance_score', -100)
-                idx = res.get('index')
-                if score < 0.05:
-                    continue
-                final_docs.append(candidate_list[idx])
+            logger.info("🧪 [评估] 初始化 RAGService...")
+            rag = RAGService(rag_db)
         except Exception as e:
-            logger.warning(f"Rerank 异常，降级截取: {e}")
-            final_docs = candidate_list[:5]
+            rag_db.close()
+            raise e
 
-        from app.core.prompts import RAG_SYSTEM_PROMPT
-        context = "\n".join([f"[资料{i + 1}]: {d}" for i, d in enumerate(final_docs)])
-        final_prompt = RAG_SYSTEM_PROMPT.format(
-            context=context,
-            graph_context="暂无图谱逻辑关联",
-            history="",
-            query=query
+        eval_data = []
+        try:
+            for ds in datasets:
+                logger.info(f"  📝 收集RAG输出: {ds.question[:30]}...")
+                try:
+                    outputs = rag.collect_eval_output(ds.question)
+                    eval_data.append({
+                        "dataset_id": ds.id,
+                        "user_input": ds.question,
+                        "retrieved_contexts": outputs["contexts"],
+                        "response": outputs["answer"],
+                        "reference": ds.reference_answer
+                    })
+                except Exception as e:
+                    logger.error(f"  ❌ 收集 RAG 输出失败: {e}")
+                    eval_data.append({
+                        "dataset_id": ds.id,
+                        "user_input": ds.question,
+                        "retrieved_contexts": [],
+                        "response": "",
+                        "reference": ds.reference_answer,
+                        "_failed": True
+                    })
+        finally:
+            rag_db.close()
+
+        return eval_data
+
+    @staticmethod
+    def _build_ragas_dataset(eval_data):
+        from ragas import EvaluationDataset
+        from ragas.dataset_schema import SingleTurnSample
+
+        samples = []
+        for item in eval_data:
+            if item.get("_failed"):
+                continue
+            samples.append(SingleTurnSample(
+                user_input=item["user_input"],
+                retrieved_contexts=item["retrieved_contexts"],
+                response=item["response"],
+                reference=item["reference"]
+            ))
+
+        return EvaluationDataset(samples=samples)
+
+    @staticmethod
+    def _run_ragas_evaluate(eval_dataset, metrics):
+        from ragas import evaluate
+        from ragas import RunConfig
+
+        run_config = RunConfig(timeout=180, max_retries=3, max_wait=10)
+
+        logger.info(f"🧪 [评估] 调用 RAGAS evaluate()，共 {len(eval_dataset.samples)} 条数据...")
+        results = evaluate(
+            dataset=eval_dataset,
+            metrics=metrics,
+            show_progress=True,
+            raise_exceptions=False,
+            run_config=run_config
         )
-
-        answer = rag.llm.invoke(final_prompt).content
-
-        return {
-            "answer": answer,
-            "contexts": final_docs
-        }
+        return results
 
     @staticmethod
     def run_evaluation(db: Session, run_id: str):
@@ -221,110 +164,63 @@ class EvaluationService:
         db.add(eval_run)
         db.commit()
 
-        llm = EvaluationService._get_llm(db)
-
-        from app.services.rag_service import RAGService
-        from app.db.session import SessionLocal
-
-        rag_db = SessionLocal()
+        eval_data = []
         try:
-            logger.info("🧪 [评估] 初始化 RAGService (仅一次)...")
-            rag = RAGService(rag_db)
+            eval_data = EvaluationService._collect_rag_outputs(datasets, db)
         except Exception as e:
             logger.error(f"❌ RAGService 初始化失败: {e}")
-            rag_db.close()
             eval_run.status = "failed"
             eval_run.updated_at = datetime.now()
             db.commit()
             return
 
-        eval_data = []
-        try:
-            for ds in datasets:
-                logger.info(f"  📝 收集RAG输出: {ds.question[:30]}...")
-                try:
-                    outputs = EvaluationService._collect_rag_outputs_with_rag(ds.question, rag)
-                    eval_data.append({
-                        "dataset_id": ds.id,
-                        "user_input": ds.question,
-                        "retrieved_contexts": outputs["contexts"],
-                        "response": outputs["answer"],
-                        "reference": ds.reference_answer
-                    })
-                except Exception as e:
-                    logger.error(f"  ❌ 收集 RAG 输出失败: {e}")
-                    eval_result = EvalResult(
-                        dataset_id=ds.id,
-                        question=ds.question,
-                        generated_answer="",
-                        retrieved_contexts=[],
-                        reference_answer=ds.reference_answer,
-                        status="failed",
-                        run_id=run_id
-                    )
-                    db.add(eval_result)
-                    db.commit()
-                    eval_run.failed_count += 1
-                    eval_run.updated_at = datetime.now()
-                    db.commit()
-                    continue
-        finally:
-            rag_db.close()
+        failed_items = [item for item in eval_data if item.get("_failed")]
+        valid_items = [item for item in eval_data if not item.get("_failed")]
 
-        if not eval_data:
+        for item in failed_items:
+            eval_result = EvalResult(
+                dataset_id=item["dataset_id"],
+                question=item["user_input"],
+                generated_answer="",
+                retrieved_contexts=[],
+                reference_answer=item["reference"],
+                status="failed",
+                run_id=run_id
+            )
+            db.add(eval_result)
+            db.commit()
+            eval_run.failed_count += 1
+            eval_run.updated_at = datetime.now()
+            db.commit()
+
+        if not valid_items:
             logger.error("所有问题的 RAG 输出收集失败，评估终止")
             eval_run.status = "failed"
             eval_run.updated_at = datetime.now()
             db.commit()
             return
 
-        for i, data_item in enumerate(eval_data):
-            logger.info(f"  📊 评估第 {i + 1}/{len(eval_data)} 条: {data_item['user_input'][:30]}...")
-            try:
-                scores = EvaluationService._evaluate_single(llm, data_item)
+        try:
+            evaluator_llm = EvaluationService._build_evaluator_llm(db)
+            evaluator_embeddings = EvaluationService._build_evaluator_embeddings(db)
+            metrics = EvaluationService._build_ragas_metrics(evaluator_llm, evaluator_embeddings)
 
-                faithfulness_val = _safe_float(scores.get("faithfulness"))
-                answer_accuracy_val = _safe_float(scores.get("answer_accuracy"))
-                answer_relevancy_val = _safe_float(scores.get("answer_relevancy"))
-                context_recall_val = _safe_float(scores.get("context_recall"))
+            eval_dataset = EvaluationService._build_ragas_dataset(eval_data)
+            ragas_results = EvaluationService._run_ragas_evaluate(eval_dataset, metrics)
 
-                score_vals = [v for v in [faithfulness_val, answer_accuracy_val, answer_relevancy_val, context_recall_val] if v is not None]
-                avg = round(sum(score_vals) / len(score_vals), 4) if score_vals else None
+            result_df = ragas_results.to_pandas()
+            logger.info(f"🧪 [评估] RAGAS 评估完成，结果列: {list(result_df.columns)}")
+            logger.info(f"🧪 [评估] RAGAS 原始结果:\n{result_df.to_string()}")
 
-                has_any_score = any(v is not None for v in [faithfulness_val, answer_accuracy_val, answer_relevancy_val, context_recall_val])
-
+        except Exception as e:
+            logger.error(f"❌ RAGAS 评估执行失败: {e}")
+            for item in valid_items:
                 eval_result = EvalResult(
-                    dataset_id=data_item["dataset_id"],
-                    question=data_item["user_input"],
-                    generated_answer=data_item["response"],
-                    retrieved_contexts=data_item["retrieved_contexts"],
-                    reference_answer=data_item["reference"],
-                    faithfulness=faithfulness_val,
-                    answer_accuracy=answer_accuracy_val,
-                    answer_relevancy=answer_relevancy_val,
-                    context_recall=context_recall_val,
-                    avg_score=avg,
-                    status="completed" if has_any_score else "failed",
-                    run_id=run_id
-                )
-                db.add(eval_result)
-                db.commit()
-
-                if has_any_score:
-                    eval_run.completed_count += 1
-                else:
-                    eval_run.failed_count += 1
-                eval_run.updated_at = datetime.now()
-                db.commit()
-
-            except Exception as e:
-                logger.error(f"  ❌ 评估失败: {e}")
-                eval_result = EvalResult(
-                    dataset_id=data_item["dataset_id"],
-                    question=data_item["user_input"],
-                    generated_answer=data_item["response"],
-                    retrieved_contexts=data_item["retrieved_contexts"],
-                    reference_answer=data_item["reference"],
+                    dataset_id=item["dataset_id"],
+                    question=item["user_input"],
+                    generated_answer=item["response"],
+                    retrieved_contexts=item["retrieved_contexts"],
+                    reference_answer=item["reference"],
                     status="failed",
                     run_id=run_id
                 )
@@ -333,6 +229,82 @@ class EvaluationService:
                 eval_run.failed_count += 1
                 eval_run.updated_at = datetime.now()
                 db.commit()
+
+            eval_run.status = "completed"
+            eval_run.updated_at = datetime.now()
+            db.commit()
+            return
+
+        metric_column_map = {}
+        for col in result_df.columns:
+            col_lower = col.lower()
+            if "faithfulness" in col_lower:
+                metric_column_map["faithfulness"] = col
+            elif "context_recall" in col_lower or "llm_context_recall" in col_lower:
+                metric_column_map["context_recall"] = col
+            elif "factual_correctness" in col_lower:
+                metric_column_map["factual_correctness"] = col
+            elif "answer_relevancy" in col_lower:
+                metric_column_map["response_relevancy"] = col
+
+        logger.info(f"🧪 [评估] 指标列映射: {metric_column_map}")
+
+        for idx, item in enumerate(valid_items):
+            if idx >= len(result_df):
+                break
+
+            row = result_df.iloc[idx]
+            score_vals_map = {}
+            nan_fields = []
+            for db_field, col_name in metric_column_map.items():
+                val = row.get(col_name)
+                float_val = _safe_float(val)
+                score_vals_map[db_field] = float_val
+                if float_val is None and val is not None:
+                    nan_fields.append(db_field)
+
+            score_vals = [v for v in score_vals_map.values() if v is not None]
+            avg = round(sum(score_vals) / len(score_vals), 4) if score_vals else None
+
+            has_any_score = any(v is not None for v in score_vals_map.values())
+
+            analysis_data = {}
+            for db_field, col_name in metric_column_map.items():
+                val = row.get(col_name)
+                if val is not None:
+                    analysis_data[db_field] = f"RAGAS {col_name}: {val}"
+            if nan_fields:
+                analysis_data["nan_fields"] = f"指标计算失败: {', '.join(nan_fields)}"
+
+            if has_any_score:
+                result_status = "completed"
+            else:
+                result_status = "failed"
+
+            eval_result = EvalResult(
+                dataset_id=item["dataset_id"],
+                question=item["user_input"],
+                generated_answer=item["response"],
+                retrieved_contexts=item["retrieved_contexts"],
+                reference_answer=item["reference"],
+                faithfulness=score_vals_map.get("faithfulness"),
+                factual_correctness=score_vals_map.get("factual_correctness"),
+                response_relevancy=score_vals_map.get("response_relevancy"),
+                context_recall=score_vals_map.get("context_recall"),
+                avg_score=avg,
+                analysis=analysis_data if analysis_data else None,
+                status=result_status,
+                run_id=run_id
+            )
+            db.add(eval_result)
+            db.commit()
+
+            if result_status == "completed":
+                eval_run.completed_count += 1
+            else:
+                eval_run.failed_count += 1
+            eval_run.updated_at = datetime.now()
+            db.commit()
 
         eval_run.status = "completed"
         eval_run.updated_at = datetime.now()
@@ -367,8 +339,8 @@ class EvaluationService:
             return {"status": "no_data"}
 
         faithfulness_vals = [_safe_float(r.faithfulness) for r in results if _safe_float(r.faithfulness) is not None]
-        answer_accuracy_vals = [_safe_float(r.answer_accuracy) for r in results if _safe_float(r.answer_accuracy) is not None]
-        answer_relevancy_vals = [_safe_float(r.answer_relevancy) for r in results if _safe_float(r.answer_relevancy) is not None]
+        factual_correctness_vals = [_safe_float(r.factual_correctness) for r in results if _safe_float(r.factual_correctness) is not None]
+        response_relevancy_vals = [_safe_float(r.response_relevancy) for r in results if _safe_float(r.response_relevancy) is not None]
         context_recall_vals = [_safe_float(r.context_recall) for r in results if _safe_float(r.context_recall) is not None]
 
         def avg(vals):
@@ -383,8 +355,8 @@ class EvaluationService:
             "failed_count": latest_run.failed_count,
             "avg_scores": {
                 "faithfulness": avg(faithfulness_vals),
-                "answer_accuracy": avg(answer_accuracy_vals),
-                "answer_relevancy": avg(answer_relevancy_vals),
+                "factual_correctness": avg(factual_correctness_vals),
+                "response_relevancy": avg(response_relevancy_vals),
                 "context_recall": avg(context_recall_vals),
             },
             "details": [
@@ -392,10 +364,11 @@ class EvaluationService:
                     "id": r.id,
                     "question": r.question[:50] + "..." if len(r.question) > 50 else r.question,
                     "faithfulness": _safe_float(r.faithfulness),
-                    "answer_accuracy": _safe_float(r.answer_accuracy),
-                    "answer_relevancy": _safe_float(r.answer_relevancy),
+                    "factual_correctness": _safe_float(r.factual_correctness),
+                    "response_relevancy": _safe_float(r.response_relevancy),
                     "context_recall": _safe_float(r.context_recall),
                     "avg_score": _safe_float(r.avg_score),
+                    "analysis": r.analysis if r.analysis else {},
                     "result_status": r.status,
                 }
                 for r in results
